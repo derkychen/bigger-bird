@@ -1,6 +1,5 @@
 # classification.py
-# Compare BiggerBird-BART (globals=NEAL QUBO, windows=greedy, teleports)
-# vs BigBird on GLUE/SST-2 with small-data regime.
+# Compare BiggerBird-BART (sparse) vs BigBird on IMDB (long sequences)
 
 from dataclasses import dataclass
 import numpy as np
@@ -20,7 +19,6 @@ from transformers.trainer_utils import EvalPrediction
 
 from biggerbird_bart import BiggerBirdBartForSequenceClassification, RouterConfig
 
-
 # -------------------------------
 # Train / Router configs
 # -------------------------------
@@ -31,37 +29,39 @@ class TrainConfig:
     bigbird_name: str = "google/bigbird-roberta-base"
 
     seed: int = 42
-    epochs: int = 4
-    batch_size: int = 16
+    epochs: int = 3
+
+    # For 1k-token sequences, keep per-device batch small; use grad accumulation
+    per_device_train_bs: int = 2
+    per_device_eval_bs: int = 2
+    grad_accum_steps: int = 8          # effective batch ~= 16
+
     lr: float = 3e-5
     weight_decay: float = 0.01
     warmup_ratio: float = 0.06
-    max_length: int = 128
-    fp16: bool = True
+    max_length: int = 1024             # long enough to trigger sparse benefits
+    use_fp16_if_cuda: bool = True
+    use_bf16_if_cuda: bool = True      # use BF16 on Ampere+ if available
 
-    # data subset for quick runs / fair comparison
+    # IMDB: 25k/25k; you can subselect for quick runs
     train_samples: int = 2000
-    eval_samples: int = 500
+    eval_samples: int = 1000
 
-    # show one layer's debug meta (BiggerBird)
     show_debug_meta: bool = True
-
 
 train_cfg = TrainConfig()
 
-# BiggerBird router config (fast & competitive defaults)
+# BiggerBird router config (long-context defaults)
 router_cfg = RouterConfig(
-    fragment_size=16,
-    k_per_query=6,
-    globals_per_head=4,
-    top_u=12,
-    proto_count=32,        # try 16–32 if contexts get very long
+    fragment_size=64,        # F (window)
+    k_per_query=8,           # k from F; << BigBird's ~448 local tokens
+    globals_per_head=4,      # g
+    top_u=16,                # expand to 16 candidates before greedy
+    proto_count=32,          # query prototypes for facility-location
     teleports_per_head=2,
     teleport_bias_frac=0.5,
-    keynorm_exponent=0.0,  # set 0.2–0.4 if key norms correlate with salience
+    keynorm_exponent=0.0,
 )
-
-
 
 # -------------------------------
 # Utilities
@@ -77,25 +77,46 @@ def compute_metrics(eval_pred):
     preds = np.argmax(logits, axis=-1)
     return {"accuracy": accuracy_score(labels, preds), "f1": f1_score(labels, preds)}
 
-def build_dataset_for_tokenizer(tokenizer, max_length: int):
-    ds = load_dataset("glue", "sst2")
-    ds["train"] = ds["train"].select(range(train_cfg.train_samples))
-    ds["validation"] = ds["validation"].select(range(train_cfg.eval_samples))
+def build_imdb_dataset(tokenizer, max_length: int):
+    ds = load_dataset("imdb")
+    if train_cfg.train_samples:
+        ds["train"] = ds["train"].shuffle(seed=train_cfg.seed).select(range(train_cfg.train_samples))
+    if train_cfg.eval_samples:
+        ds["test"] = ds["test"].shuffle(seed=train_cfg.seed).select(range(train_cfg.eval_samples))
 
     def tok_fn(batch):
-        return tokenizer(batch["sentence"], truncation=True, max_length=max_length)
+        return tokenizer(
+            batch["text"],
+            truncation=True,
+            max_length=max_length,
+        )
 
-    ds = ds.map(tok_fn, batched=True)
+    ds = ds.map(tok_fn, batched=True, remove_columns=["text"])
     ds = ds.rename_column("label", "labels")
     ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
-    return ds
+    return {"train": ds["train"], "validation": ds["test"]}
+
+def device_flags():
+    use_cuda = torch.cuda.is_available()
+    use_mps = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
+    fp16 = bool(train_cfg.use_fp16_if_cuda and use_cuda)
+    bf16 = bool(train_cfg.use_bf16_if_cuda and use_cuda and torch.cuda.is_bf16_supported())
+    # On MPS, keep fp16/bf16 off; kernels are still finicky with long seqs
+    if use_mps:
+        fp16 = False
+        bf16 = False
+    torch_compile = bool(use_cuda)  # generally safe; disable on MPS
+    pin_mem = bool(use_cuda)        # keep False on MPS/CPU
+    return fp16, bf16, torch_compile, pin_mem
 
 def make_args(out_dir: str) -> TrainingArguments:
+    fp16, bf16, torch_compile, pin_mem = device_flags()
     return TrainingArguments(
         output_dir=out_dir,
         num_train_epochs=train_cfg.epochs,
-        per_device_train_batch_size=train_cfg.batch_size,
-        per_device_eval_batch_size=train_cfg.batch_size,
+        per_device_train_batch_size=train_cfg.per_device_train_bs,
+        per_device_eval_batch_size=train_cfg.per_device_eval_bs,
+        gradient_accumulation_steps=train_cfg.grad_accum_steps,
         learning_rate=train_cfg.lr,
         weight_decay=train_cfg.weight_decay,
         warmup_ratio=train_cfg.warmup_ratio,
@@ -104,15 +125,25 @@ def make_args(out_dir: str) -> TrainingArguments:
         eval_strategy="no",                 # evaluate explicitly after training
         save_strategy="no",
         report_to="none",
-        fp16=(train_cfg.fp16 and torch.cuda.is_available()),
-        gradient_accumulation_steps=1,
-        remove_unused_columns=False,
-        dataloader_num_workers=0,           # portable (macOS-safe)
-        dataloader_pin_memory=torch.cuda.is_available(),
+        fp16=fp16,
+        bf16=bf16,
+        remove_unused_columns=False,        # we pass all columns already
+        dataloader_num_workers=2,           # low for macOS
+        dataloader_pin_memory=pin_mem,
         gradient_checkpointing=True,
-        torch_compile=False,
+        torch_compile=torch_compile,
+        # padding multiple helps Flash/blocks; harmless otherwise
+        optim="adamw_torch",
     )
 
+# Robust BigBird tokenizer (avoid slow->fast conversion path)
+def load_bigbird_tok(model_name: str):
+    try:
+        from transformers import BigBirdTokenizer
+        return BigBirdTokenizer.from_pretrained(model_name)  # slow, stable
+    except Exception as e_slow:
+        print(f"[BigBird] slow tokenizer failed: {e_slow}\nTrying fast tokenizer...", flush=True)
+        return AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
 # -------------------------------
 # Trainers
@@ -120,8 +151,8 @@ def make_args(out_dir: str) -> TrainingArguments:
 
 def train_and_eval_biggerbird(tokenizer, ds):
     model = BiggerBirdBartForSequenceClassification.from_pretrained(train_cfg.bart_name, cfg=router_cfg)
-    collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    args = make_args("./qatten-out")
+    collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=64)
+    args = make_args("./biggerbird-out")
 
     callback = TrainerCallback()
     trainer = Trainer(
@@ -135,7 +166,7 @@ def train_and_eval_biggerbird(tokenizer, ds):
         callbacks=[callback],
     )
 
-    print("Training BiggerBird-BART (globals=NEAL, windows=greedy, teleports) ...", flush=True)
+    print("Training BiggerBird-BART (sparse windows + facility-location globals) ...", flush=True)
     train_res = trainer.train()
     print(train_res.metrics)
 
@@ -152,15 +183,12 @@ def train_and_eval_biggerbird(tokenizer, ds):
                 break
     return eval_res
 
-
 def train_and_eval_bigbird(tokenizer, ds):
-    # BigBird fast tokenizer can error on some platforms; use slow tokenizer intentionally.
-    # We already passed use_fast=False when creating this tokenizer below.
     model = AutoModelForSequenceClassification.from_pretrained(
         train_cfg.bigbird_name,
         num_labels=2,
     )
-    collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=64)
     args = make_args("./bigbird-out")
 
     base_trainer = Trainer(
@@ -173,7 +201,7 @@ def train_and_eval_bigbird(tokenizer, ds):
         compute_metrics=compute_metrics,
     )
 
-    print("Training BigBird baseline...", flush=True)
+    print("Training BigBird baseline (sparse) ...", flush=True)
     train_res = base_trainer.train()
     print(train_res.metrics)
 
@@ -181,7 +209,6 @@ def train_and_eval_bigbird(tokenizer, ds):
     eval_res = base_trainer.evaluate()
     print(eval_res)
     return eval_res
-
 
 # -------------------------------
 # Main
@@ -192,23 +219,21 @@ def main():
 
     # BART tokenizer (fast OK)
     bart_tok = AutoTokenizer.from_pretrained(train_cfg.bart_name, use_fast=True)
-    ds_bart = build_dataset_for_tokenizer(bart_tok, train_cfg.max_length)
+    ds_bart = build_imdb_dataset(bart_tok, train_cfg.max_length)
 
-    # BigBird tokenizer: prefer slow to avoid conversion/Tiktoken glitches on macOS
-    bigbird_tok = AutoTokenizer.from_pretrained(train_cfg.bigbird_name, use_fast=False)
-    ds_bigbird = build_dataset_for_tokenizer(bigbird_tok, train_cfg.max_length)
+    # BigBird tokenizer: prefer slow to avoid Tiktoken conversion glitches
+    bigbird_tok = load_bigbird_tok(train_cfg.bigbird_name)
+    ds_bigbird = build_imdb_dataset(bigbird_tok, train_cfg.max_length)
 
     # Train + eval
-    qa_eval = train_and_eval_biggerbird(bart_tok, ds_bart)
-    bb_eval = train_and_eval_bigbird(bigbird_tok, ds_bigbird)
+    bbird_eval = train_and_eval_biggerbird(bart_tok, ds_bart)
+    bigbird_eval = train_and_eval_bigbird(bigbird_tok, ds_bigbird)
 
     print("\n==== Summary ====")
-    print("[BiggerBird-BART] ", qa_eval)
-    print("[BigBird]         ", bb_eval)
-
+    print("[BiggerBird-BART] ", bbird_eval)
+    print("[BigBird]         ", bigbird_eval)
 
 if __name__ == "__main__":
-    # modest matmul tweak (if CUDA available)
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:

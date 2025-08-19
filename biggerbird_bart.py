@@ -493,16 +493,25 @@ class BiggerBird(BartAttention):
 )
             self._logged_pairs = True
 
-        # Apply attention mask
+        # Apply attention mask (memory-safe)
         if attention_mask is not None:
             am_bool = attention_mask if attention_mask.dtype == torch.bool else (attention_mask > -1e8)
+            # normalize shapes: [B, 1, 1, Tk] or [B, 1, Tq, Tk]
             if am_bool.dim() == 3:
                 am_bool = am_bool.unsqueeze(1)
             if am_bool.dim() == 2:
-                am_bool = am_bool[:, None, None, :]
-            am_bh = am_bool.expand(bsz, self.num_heads, tgt_len, src_len).reshape(BH, tgt_len, src_len)
-            allowed = torch.gather(am_bh, -1, abs_idx)  # [BH,Tq,M]
+                am_bool = am_bool[:, None, None, :]  # [B,1,1,Tk]
+            # reshape indices by head to avoid BH×Tq×Tk expansion
+            abs_idx_hb = abs_idx.view(self.num_heads, bsz, tgt_len, M)  # [H,B,Tq,M]
+            allowed_chunks = []
+            for h in range(self.num_heads):
+                # broadcast over head dimension lazily (no materialization)
+                am_small = am_bool.expand(bsz, 1, tgt_len, src_len)     # view
+                allowed_h = torch.gather(am_small, -1, abs_idx_hb[h].unsqueeze(1)).squeeze(1)  # [B,Tq,M]
+                allowed_chunks.append(allowed_h)
+            allowed = torch.cat(allowed_chunks, dim=0)  # [BH,Tq,M]
             scores_sel = scores_sel.masked_fill(~allowed, torch.finfo(scores_sel.dtype).min)
+
 
         # Softmax + dropout + output
         attn_probs = F.softmax(scores_sel, dim=-1)
