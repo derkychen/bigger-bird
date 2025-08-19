@@ -149,103 +149,90 @@ class GlobalChooser:
     def __init__(self, cfg: RouterConfig):
         self.cfg = cfg
 
-    @staticmethod
-    def _downsample_queries(qh: torch.Tensor, p: int) -> torch.Tensor:
-        """
-        qh: [Tq, d] (unit-norm recommended)
-        Returns [p', d] where p' = min(p, Tq).
-        Simple, fast: evenly-spaced subsample along sequence.
-        """
-        Tq = qh.size(0)
-        if p <= 0 or p >= Tq:
-            return qh
-        # evenly-spaced indices in [0, Tq-1]
-        idx = torch.round(torch.linspace(0, Tq - 1, steps=p, device=qh.device)).long()
-        return qh.index_select(dim=0, index=idx)
+    def _proto_idx(self, Tq: int, p: int, device) -> torch.Tensor:
+        if p <= 0 or p >= Tq:  # use all
+            return torch.arange(Tq, device=device)
+        return torch.round(torch.linspace(0, Tq - 1, steps=p, device=device)).long()
 
     def choose_packed(self, key_states: torch.Tensor, q_summary: torch.Tensor,
                       bsz: int, num_heads: int) -> List[torch.Tensor]:
         """
-        key_states: [BH, Tk, d] (grouped by head)
-        q_summary:  [H,  Tq, d] (unit-normalized queries per head, averaged over batch upstream)
-        Returns list length H with LongTensor[g] per head (absolute token indices).
+        key_states: [BH, Tk, d], q_summary: [H, Tq, d] (L2-normalized)
+        Returns list of length H with LongTensor[g] per head.
         """
         device = key_states.device
+        H = num_heads
         g = int(self.cfg.globals_per_head)
         U_target = max(1, int(self.cfg.top_u))
         p = max(1, int(self.cfg.proto_count))
 
-        out: List[torch.Tensor] = []
+        # --- mean keys per head over batch, vectorized over heads ---
+        BH, Tk, d = key_states.shape
+        Kmean = key_states.view(H, bsz, Tk, d).mean(dim=1)              # [H, Tk, d]
+        Kbar  = F_normalize_safe(Kmean, dim=-1)                         # [H, Tk, d]
 
-        for h in range(num_heads):
-            # --- per-head candidate utilities (same as your current blend) ---
-            head_slice = key_states[h::num_heads]               # [B, Tk, d]
-            Kraw = head_slice.mean(dim=0)                       # [Tk, d]
-            Kbar = F_normalize_safe(Kraw, dim=-1)               # [Tk, d]
-            Tk = Kbar.size(0)
+        # --- query prototypes (same indices for all heads; cheap & stable) ---
+        Tq = q_summary.size(1)
+        idxp = self._proto_idx(Tq, p, device)                           # [p']
+        Qp = q_summary.index_select(1, idxp)                            # [H, p', d]
 
-            qh = q_summary[h]                                   # [Tq, d] (already unit norm)
-            S_full = torch.relu(Kbar @ qh.transpose(0, 1))      # [Tk, Tq]
+        # --- similarities S = ReLU(Kbar @ Qp^T), batched over heads ---
+        # shape: [H, Tk, p']
+        S = torch.relu(torch.einsum('hkd,hpd->hkp', Kbar, Qp))
 
-            mean = S_full.mean(dim=1)                           # [Tk]
-            mx   = S_full.max(dim=1).values
-            kq   = max(1, int(round(S_full.size(1) * self.cfg.topk_frac)))
-            topk_mean = torch.topk(S_full, k=kq, dim=1, largest=True).values.mean(dim=1)
-            std  = S_full.std(dim=1)
+        # --- utility on prototypes (avoid full Tq pass) ---
+        mean = S.mean(dim=-1)                                           # [H, Tk]
+        mx   = S.max(dim=-1).values                                     # [H, Tk]
+        kq   = max(1, int(round(S.size(-1) * self.cfg.topk_frac)))
+        topk_mean = torch.topk(S, k=kq, dim=-1, largest=True).values.mean(dim=-1)  # [H, Tk]
+        std  = S.std(dim=-1)
 
-            u_full = (self.cfg.w_mean * mean
-                    + self.cfg.w_max  * mx
-                    + self.cfg.w_topk * topk_mean
-                    + self.cfg.w_std  * std)
+        u_full = (self.cfg.w_mean * mean + self.cfg.w_max * mx
+                  + self.cfg.w_topk * topk_mean + self.cfg.w_std * std) # [H, Tk]
 
-            if self.cfg.keynorm_exponent != 0.0:
-                kn = Kraw.norm(dim=-1).clamp_min(1e-6)
-                u_full = u_full * (kn / kn.mean()).pow(self.cfg.keynorm_exponent)
+        if self.cfg.keynorm_exponent != 0.0:
+            kn = Kmean.norm(dim=-1).clamp_min(1e-6)                     # [H, Tk]
+            u_full = u_full * (kn / kn.mean(dim=1, keepdim=True)).pow(self.cfg.keynorm_exponent)
 
-            # --- Top-U prefilter ---
-            U = int(min(U_target, Tk))
-            if U < g:
-                U = max(g, min(8, Tk))
-            U = max(1, min(U, Tk))
-            top_idx = torch.topk(u_full, k=U).indices           # [U]
-            Kbar_sub = Kbar.index_select(0, top_idx)            # [U, d]
+        # --- Top-U prefilter per head (batched topk) ---
+        U = int(min(U_target, Tk))
+        if U < g: U = max(g, min(8, Tk))
+        U = max(1, min(U, Tk))
+        u_vals, top_idx = torch.topk(u_full, k=U, dim=1)                # [H, U]
+        # S_sub: [H, U, p']
+        S_sub = torch.gather(S, dim=1, index=top_idx.unsqueeze(-1).expand(-1, -1, S.size(-1)))
 
-            # --- Query prototypes & similarities for facility-location ---
-            q_proto = self._downsample_queries(qh, p)           # [p', d]
-            S = torch.relu(Kbar_sub @ q_proto.transpose(0, 1))  # [U, p']
+        # --- Greedy facility-location (vectorized over heads, loop only over g) ---
+        H_range = torch.arange(H, device=device)
+        p_eff = S_sub.size(-1)
+        m = torch.zeros(H, p_eff, device=device, dtype=S_sub.dtype)     # [H, p']
+        blocked = torch.zeros(H, U, device=device, dtype=torch.bool)    # [H, U]
+        chosen_local = torch.zeros(H, g, device=device, dtype=torch.long)
 
-            # --- Greedy facility-location with exact budget g ---
-            p_eff = S.size(1)
-            m = torch.zeros(p_eff, device=device, dtype=S.dtype)  # current per-prototype max
-            chosen_local: List[int] = []
-            blocked = torch.zeros(U, device=device, dtype=torch.bool)
+        steps = min(g, U)
+        for r in range(steps):
+            gains = torch.relu(S_sub - m.unsqueeze(1)).sum(dim=-1)      # [H, U]
+            gains = gains.masked_fill(blocked, -1e9)
+            j = gains.argmax(dim=1)                                     # [H]
+            chosen_local[:, r] = j
+            blocked[H_range, j] = True
+            m = torch.maximum(m, S_sub[H_range, j, :])                  # update per head
 
-            for _ in range(min(g, U)):
-                gains = torch.relu(S - m).sum(dim=1)             # [U]
-                gains = gains.masked_fill(blocked, -1e9)
-                j = int(gains.argmax().item())
-                chosen_local.append(j)
-                blocked[j] = True
-                m = torch.maximum(m, S[j])
+        # Top-off if needed (rare when U < g)
+        if steps < g:
+            # pick remaining by utility among available
+            remaining_mask = ~blocked
+            # set gains to utility among remaining; otherwise -inf
+            rem_util = torch.where(remaining_mask, u_vals, torch.full_like(u_vals, -1e9))
+            fill = torch.topk(rem_util, k=(g - steps), dim=1).indices    # [H, g-steps]
+            chosen_local[:, steps:] = fill
 
-            # Top-off if U < g (rare)
-            while len(chosen_local) < g:
-                # reuse best by utility u_full among remaining candidates
-                remaining = (~blocked).nonzero(as_tuple=False).flatten()
-                if remaining.numel() == 0:
-                    chosen_local.append(0)
-                    break
-                # map remaining back to absolute indices then to u_full
-                rem_abs = top_idx.index_select(0, remaining)
-                rem_scores = u_full.index_select(0, rem_abs)
-                best_rem = int(remaining[torch.argmax(rem_scores)].item())
-                chosen_local.append(best_rem)
-                blocked[best_rem] = True
+        # Map back to absolute token indices per head: [H, g]
+        chosen_abs = torch.gather(top_idx, dim=1, index=chosen_local)
 
-            chosen_abs = top_idx.index_select(0, torch.tensor(chosen_local, device=device))
-            out.append(chosen_abs.to(device=device, dtype=torch.long))
+        # Return list of tensors per head
+        return [chosen_abs[h].to(device=device, dtype=torch.long) for h in range(H)]
 
-        return out
 
 
 
@@ -475,9 +462,35 @@ class BiggerBird(BartAttention):
 
         # log pairs (cost proxy) once
         if self.cfg.log_once_pairs and not self._logged_pairs:
-            scored_pairs = scores_win.numel()
-            dense_pairs = Q.shape[0] * Q.shape[1] * K.shape[1]
-            print(f"[pairs] scored={scored_pairs:,} dense={dense_pairs:,} ratio={scored_pairs / max(1, dense_pairs):.6f}")
+            # --- Softmax-comparison ratio (sparse vs full) ---
+            BH = bsz * self.num_heads
+            Tk = K.shape[1]
+            M_now = abs_idx.size(-1)
+
+            # logits "sent to softmax"
+            comps_sparse = BH * tgt_len * M_now                   # sparse
+            comps_full_unmasked = BH * tgt_len * Tk               # full (no masking)
+
+            ratio_softmax = comps_sparse / max(1, comps_full_unmasked)
+
+            # Optional: account for padding/causal masks in the "full" baseline
+            if attention_mask is not None:
+                am_bool = attention_mask if attention_mask.dtype == torch.bool else (attention_mask > -1e8)
+                if am_bool.dim() == 3:  # [B, Tq, Tk] -> [B, 1, Tq, Tk]
+                    am_bool = am_bool.unsqueeze(1)
+                if am_bool.dim() == 2:  # [B, Tk] -> [B, 1, 1, Tk]
+                    am_bool = am_bool[:, None, None, :]
+                am_bh_full = am_bool.expand(bsz, self.num_heads, tgt_len, Tk).reshape(BH, tgt_len, Tk)
+                comps_full_masked = int(am_bh_full.sum().item())  # how many logits are actually "active"
+            else:
+                comps_full_masked = comps_full_unmasked
+
+            ratio_softmax_eff = comps_sparse / max(1, comps_full_masked)
+
+            print(
+                f"[softmax] sparse={comps_sparse:,}  |  full(unmasked)={comps_full_unmasked:,} "
+                f"ratio={ratio_softmax:.4f}  |  full(masked)={comps_full_masked:,} eff_ratio={ratio_softmax_eff:.4f}"
+)
             self._logged_pairs = True
 
         # Apply attention mask
