@@ -1,42 +1,27 @@
-# classification.py
-# Single-file BiggerBird (BART patch + training) with MPS-safe optimizations:
-#   - Locals: sliding-window view (no BH×Tq×Tk×d expand)
-#   - Selections: flat batched gather (no huge expand)
-#   - Teleports: prototype-biased (+ uniform) to keep O(n)
-#   - Masking: head-sliced gather (no head-wide expand)
-#   - Training args tuned for macOS MPS
+# biggerbird_bart.py
+# BiggerBird for BART with:
+#   • Globals: packed QUBO solved by NEAL (default) or Tabu (toggle)
+#   • Windows: greedy k-selection w/ cosine diversity
+#   • Teleports: biased + uniform mix, per head
+#   • Amortization: reuse global selections across adjacent encoder layers
+#
+# Vectorized QUBO build (NumPy + integer labels) for 3–6× faster BQM construction.
 
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
-import os
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset
-from sklearn.metrics import accuracy_score, f1_score
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-    Trainer,
-    TrainingArguments,
-    DataCollatorWithPadding,
-    TrainerCallback,
-    set_seed,
-)
-from transformers.trainer_utils import EvalPrediction
-
-# -------------------------------
-# Router / Model patch
-# -------------------------------
+import numpy as np
 
 try:
     from transformers.models.bart.modeling_bart import BartAttention
 except Exception as e:
     raise ImportError("Transformers with BART is required. Install: pip install transformers") from e
 
+# ===============================
+# Config
+# ===============================
 
 @dataclass
 class RouterConfig:
@@ -44,20 +29,20 @@ class RouterConfig:
     patch_encoder_only: bool = True
 
     # Candidate construction
-    fragment_size: int = 48      # window size Fw — clamped to src_len
-    k_per_query: int = 6         # locals picked from the window
-    globals_per_head: int = 4    # g per head
+    fragment_size: int = 16      # F (window size) — clamped to src_len
+    k_per_query: int = 6         # k (picked from the window per query)
+    globals_per_head: int = 4    # g (per head, per layer)
 
-    # Softmax target fraction (controls k on short sequences)
-    r_target_softmax: float = 0.08
-    min_k: int = 6
-    max_k: int = 14
+    # RouterConfig
+    r_target_softmax: float = 0.08  # try ~8% on short seqs
+    min_k: int = 6                  # never go below this
+    max_k: int = 14                 # hard cap keeps O(n)
 
     # Teleports
     teleports_per_head: int = 2
     teleport_bias_frac: float = 0.5
 
-    # Utility shaping for globals (facility-location proxy)
+    # --- Utility shaping (query coverage) ---
     w_mean: float = 1.0
     w_max: float = 0.6
     w_topk: float = 0.4
@@ -65,25 +50,30 @@ class RouterConfig:
     topk_frac: float = 0.2
     keynorm_exponent: float = 0.0
 
-    # Scoring blend / locals
+    # Scoring blend / windows
     alpha_pos_prior: float = 0.2
     gamma_diversity: float = 0.2   # window selection diversity
 
     # Globals (prefilter + prototypes)
-    top_u: int = 12                # per-head prefilter size U
-    proto_count: int = 16          # query prototypes p (<= Tq)
+    top_u: int = 12                # Top-U prefilter per head before selection
+    proto_count: int = 32          # downsample queries to p prototypes per head (<= Tq)
 
     # Amortization
-    share_stride_layers: int = 2   # reuse globals across adjacent layers
+    share_stride_layers: int = 2
 
     # Misc / Debug
-    random_selection: bool = False
+    random_selection: bool = False   # windows only
     debug_collect: bool = False
     log_once_pairs: bool = True
 
 
+
 default_router_config = RouterConfig()
 
+
+# ===============================
+# Runtime cache for amortization
+# ===============================
 
 class RouterRuntime:
     def __init__(self, num_heads: int, cfg: RouterConfig):
@@ -122,13 +112,9 @@ class RouterRuntime:
         self._last_layer_src_len[layer_idx] = src_len
 
 
-# --------- small helpers ---------
-def F_normalize_safe(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    return x / (x.norm(dim=dim, keepdim=True).clamp_min(eps))
-
-def positional_prior(indices: torch.Tensor, center_positions: torch.Tensor, tau: float = 8.0) -> torch.Tensor:
-    dist = (indices - center_positions.unsqueeze(1)).abs().float()
-    return torch.exp(-dist / max(tau, 1e-6))
+# ===============================
+# Index builders
+# ===============================
 
 def build_indices_encoder(seq_len: int, frag: int, device: torch.device) -> torch.Tensor:
     half = frag // 2
@@ -148,40 +134,28 @@ def build_indices_cross(tgt_len: int, src_len: int, frag: int, device: torch.dev
     starts = torch.clamp(centers - half, 0, max(0, src_len - frag))
     return starts.unsqueeze(1) + torch.arange(frag, device=device).unsqueeze(0)
 
-def sliding_window_view_seq(x: torch.Tensor, Fw: int, causal: bool) -> torch.Tensor:
-    # x: [BH, T, d] -> [BH, T, Fw, d]
-    BH, T, D = x.shape
-    if causal:
-        left, right = Fw - 1, 0
-    else:
-        left = Fw // 2
-        right = Fw - 1 - left
-    xpad = F.pad(x, (0, 0, left, right), mode="replicate")  # [BH, T+left+right, d]
-    s0, sT, sD = xpad.stride()
-    return xpad.as_strided(size=(BH, T, Fw, D), stride=(s0, sT, sT, sD))
+def positional_prior(indices: torch.Tensor, center_positions: torch.Tensor, tau: float = 8.0) -> torch.Tensor:
+    dist = (indices - center_positions.unsqueeze(1)).abs().float()
+    return torch.exp(-dist / max(tau, 1e-6))
+
+def F_normalize_safe(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    return x / (x.norm(dim=dim, keepdim=True).clamp_min(eps))
 
 
-def flat_batched_gather_kv(K_or_V: torch.Tensor, abs_idx: torch.Tensor) -> torch.Tensor:
-    """
-    K_or_V: [BH, Tk, d], abs_idx: [BH, Tq, M]
-    returns [BH, Tq, M, d] without BH×Tq×Tk expands.
-    """
-    BH, Tk, d = K_or_V.shape
-    _, Tq, M = abs_idx.shape
-    base = (torch.arange(BH, device=K_or_V.device) * Tk).view(BH, 1, 1)  # [BH,1,1]
-    flat_idx = (abs_idx + base).reshape(-1)                              # [BH*Tq*M]
-    flat = K_or_V.reshape(BH * Tk, d)
-    out = flat.index_select(0, flat_idx)
-    return out.view(BH, Tq, M, d)
+# ===============================
+# Globals chooser (QUBO + sampler) — VECTORIZED
+# ===============================
 
+# ===============================
+# Globals chooser (facility-location greedy)
+# ===============================
 
-# --------- selection modules ---------
 class GlobalChooser:
     def __init__(self, cfg: RouterConfig):
         self.cfg = cfg
 
     def _proto_idx(self, Tq: int, p: int, device) -> torch.Tensor:
-        if p <= 0 or p >= Tq:
+        if p <= 0 or p >= Tq:  # use all
             return torch.arange(Tq, device=device)
         return torch.round(torch.linspace(0, Tq - 1, steps=p, device=device)).long()
 
@@ -189,7 +163,7 @@ class GlobalChooser:
                       bsz: int, num_heads: int) -> List[torch.Tensor]:
         """
         key_states: [BH, Tk, d], q_summary: [H, Tq, d] (L2-normalized)
-        returns per-head LongTensor[g]
+        Returns list of length H with LongTensor[g] per head.
         """
         device = key_states.device
         H = num_heads
@@ -197,68 +171,85 @@ class GlobalChooser:
         U_target = max(1, int(self.cfg.top_u))
         p = max(1, int(self.cfg.proto_count))
 
+        # --- mean keys per head over batch, vectorized over heads ---
         BH, Tk, d = key_states.shape
-        Kmean = key_states.view(H, bsz, Tk, d).mean(dim=1)      # [H, Tk, d]
-        Kbar  = F_normalize_safe(Kmean, dim=-1)                 # [H, Tk, d]
+        Kmean = key_states.view(H, bsz, Tk, d).mean(dim=1)              # [H, Tk, d]
+        Kbar  = F_normalize_safe(Kmean, dim=-1)                         # [H, Tk, d]
 
+        # --- query prototypes (same indices for all heads; cheap & stable) ---
         Tq = q_summary.size(1)
-        idxp = self._proto_idx(Tq, p, device)                   # [p']
-        Qp = q_summary.index_select(1, idxp)                    # [H, p', d]
+        idxp = self._proto_idx(Tq, p, device)                           # [p']
+        Qp = q_summary.index_select(1, idxp)                            # [H, p', d]
 
-        # Prototype coverage scores per head token
-        S = torch.relu(torch.einsum('hkd,hpd->hkp', Kbar, Qp))  # [H,Tk,p']
-        mean = S.mean(dim=-1)
-        mx   = S.max(dim=-1).values
+        # --- similarities S = ReLU(Kbar @ Qp^T), batched over heads ---
+        # shape: [H, Tk, p']
+        S = torch.relu(torch.einsum('hkd,hpd->hkp', Kbar, Qp))
+
+        # --- utility on prototypes (avoid full Tq pass) ---
+        mean = S.mean(dim=-1)                                           # [H, Tk]
+        mx   = S.max(dim=-1).values                                     # [H, Tk]
         kq   = max(1, int(round(S.size(-1) * self.cfg.topk_frac)))
-        topk_mean = torch.topk(S, k=kq, dim=-1).values.mean(dim=-1)
+        topk_mean = torch.topk(S, k=kq, dim=-1, largest=True).values.mean(dim=-1)  # [H, Tk]
         std  = S.std(dim=-1)
 
         u_full = (self.cfg.w_mean * mean + self.cfg.w_max * mx
-                  + self.cfg.w_topk * topk_mean + self.cfg.w_std * std)  # [H,Tk]
+                  + self.cfg.w_topk * topk_mean + self.cfg.w_std * std) # [H, Tk]
 
         if self.cfg.keynorm_exponent != 0.0:
-            kn = Kmean.norm(dim=-1).clamp_min(1e-6)
+            kn = Kmean.norm(dim=-1).clamp_min(1e-6)                     # [H, Tk]
             u_full = u_full * (kn / kn.mean(dim=1, keepdim=True)).pow(self.cfg.keynorm_exponent)
 
+        # --- Top-U prefilter per head (batched topk) ---
         U = int(min(U_target, Tk))
         if U < g: U = max(g, min(8, Tk))
         U = max(1, min(U, Tk))
+        u_vals, top_idx = torch.topk(u_full, k=U, dim=1)                # [H, U]
+        # S_sub: [H, U, p']
+        S_sub = torch.gather(S, dim=1, index=top_idx.unsqueeze(-1).expand(-1, -1, S.size(-1)))
 
-        u_vals, top_idx = torch.topk(u_full, k=U, dim=1)  # [H,U]
-        S_sub = torch.gather(S, dim=1, index=top_idx.unsqueeze(-1).expand(-1, -1, S.size(-1)))  # [H,U,p']
-
-        # Greedy facility-location on S_sub
+        # --- Greedy facility-location (vectorized over heads, loop only over g) ---
         H_range = torch.arange(H, device=device)
         p_eff = S_sub.size(-1)
-        m = torch.zeros(H, p_eff, device=device, dtype=S_sub.dtype)
-        blocked = torch.zeros(H, U, device=device, dtype=torch.bool)
+        m = torch.zeros(H, p_eff, device=device, dtype=S_sub.dtype)     # [H, p']
+        blocked = torch.zeros(H, U, device=device, dtype=torch.bool)    # [H, U]
         chosen_local = torch.zeros(H, g, device=device, dtype=torch.long)
 
         steps = min(g, U)
         for r in range(steps):
-            gains = torch.relu(S_sub - m.unsqueeze(1)).sum(dim=-1)  # [H,U]
+            gains = torch.relu(S_sub - m.unsqueeze(1)).sum(dim=-1)      # [H, U]
             gains = gains.masked_fill(blocked, -1e9)
-            j = gains.argmax(dim=1)                                 # [H]
+            j = gains.argmax(dim=1)                                     # [H]
             chosen_local[:, r] = j
             blocked[H_range, j] = True
-            m = torch.maximum(m, S_sub[H_range, j, :])
+            m = torch.maximum(m, S_sub[H_range, j, :])                  # update per head
 
+        # Top-off if needed (rare when U < g)
         if steps < g:
+            # pick remaining by utility among available
             remaining_mask = ~blocked
+            # set gains to utility among remaining; otherwise -inf
             rem_util = torch.where(remaining_mask, u_vals, torch.full_like(u_vals, -1e9))
-            fill = torch.topk(rem_util, k=(g - steps), dim=1).indices
+            fill = torch.topk(rem_util, k=(g - steps), dim=1).indices    # [H, g-steps]
             chosen_local[:, steps:] = fill
 
-        chosen_abs = torch.gather(top_idx, dim=1, index=chosen_local)  # [H,g]
+        # Map back to absolute token indices per head: [H, g]
+        chosen_abs = torch.gather(top_idx, dim=1, index=chosen_local)
+
+        # Return list of tensors per head
         return [chosen_abs[h].to(device=device, dtype=torch.long) for h in range(H)]
 
+
+
+
+# ===============================
+# Window selector (greedy only)
+# ===============================
 
 class WindowSelector:
     def __init__(self, cfg: RouterConfig):
         self.cfg = cfg
 
-    def select_greedy(self, scores_win: torch.Tensor, prior_win: torch.Tensor,
-                      keys_win: Optional[torch.Tensor] = None, k_override: Optional[int] = None) -> torch.Tensor:
+    def select_greedy(self, scores_win: torch.Tensor, prior_win: torch.Tensor, keys_win=None, k_override=None) -> torch.Tensor:
         BH, Tq, Fw = scores_win.shape
         k = int(self.cfg.k_per_query)
         k = min(int(k_override if k_override is not None else k), Fw)
@@ -276,28 +267,32 @@ class WindowSelector:
 
         kv = None
         if keys_win is not None:
-            kv = F_normalize_safe(keys_win, dim=-1)  # [BH, Tq, Fw, d]
+            kv = F_normalize_safe(keys_win, dim=-1)  # [BH, Tq, F, d]
 
         for r in range(k):
             j = tmp.argmax(dim=-1)  # [BH, Tq]
             sel_idx[:, :, r] = j
             if kv is not None and r < k - 1:
                 j_exp = j.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, kv.size(-1))
-                sel_vec = torch.gather(kv, -2, j_exp).squeeze(-2)        # [BH,Tq,d]
-                cos = (kv * sel_vec.unsqueeze(-2)).sum(dim=-1).clamp(min=0)  # [BH,Tq,Fw]
+                sel_vec = torch.gather(kv, -2, j_exp).squeeze(-2)  # [BH,Tq,d]
+                cos = (kv * sel_vec.unsqueeze(-2)).sum(dim=-1).clamp(min=0)  # [BH,Tq,F]
                 tmp = tmp - self.cfg.gamma_diversity * cos
             tmp.scatter_(-1, j.unsqueeze(-1), -1e9)
 
         return sel_idx
 
 
+# ===============================
+# Attention patch
+# ===============================
+
 class BiggerBird(BartAttention):
     def __init__(self, base_attn: BartAttention, cfg: RouterConfig, runtime: RouterRuntime):
-        self.drop_p = base_attn.dropout.p if isinstance(base_attn.dropout, nn.Dropout) else float(base_attn.dropout)
+        drop_p = base_attn.dropout.p if isinstance(base_attn.dropout, nn.Dropout) else float(base_attn.dropout)
         super().__init__(
             embed_dim=base_attn.embed_dim,
             num_heads=base_attn.num_heads,
-            dropout=self.drop_p,
+            dropout=drop_p,
             is_decoder=base_attn.is_decoder,
             bias=base_attn.k_proj.bias is not None,
             is_causal=getattr(base_attn, "is_causal", False),
@@ -355,7 +350,7 @@ class BiggerBird(BartAttention):
         src_len = K.size(1)
 
         # Window indices + prior
-        Fw = min(int(self.cfg.fragment_size), src_len)
+        Fw = min(int(self.cfg.fragment_size), src_len)  # clamp
         if is_cross_attention:
             idx_win = build_indices_cross(tgt_len, src_len, Fw, device)
             centers = torch.round(torch.linspace(0, src_len - 1, steps=tgt_len, device=device)).long()
@@ -364,39 +359,37 @@ class BiggerBird(BartAttention):
                       else build_indices_encoder(tgt_len, Fw, device)
             centers = torch.arange(tgt_len, device=device).long().clamp(0, src_len - 1)
 
-        # Locals: get K_win without huge expand
-        if is_cross_attention:
-            idx_expanded = idx_win.view(1, tgt_len, Fw, 1).expand(BH, tgt_len, Fw, self.head_dim)
-            K_win = torch.gather(K.unsqueeze(1).expand(BH, tgt_len, src_len, self.head_dim), 2, idx_expanded)
-        else:
-            K_win = sliding_window_view_seq(K, Fw=Fw, causal=bool(self.is_decoder))  # [BH,Tq,Fw,d]
-
-        # locals: Q [BH,Tq,d], K_win [BH,Tq,Fw,d]
-        scores_win = torch.matmul(Q.unsqueeze(2), K_win.transpose(-1, -2)).squeeze(2)  # [BH,Tq,Fw]
-        prior_win = positional_prior(idx_win, centers, tau=max(Fw / 4, 1.0))           # [Tq,Fw]
+        idx_expanded = idx_win.view(1, tgt_len, Fw, 1).expand(BH, tgt_len, Fw, self.head_dim)
+        K_win = torch.gather(K.unsqueeze(1).expand(BH, tgt_len, src_len, self.head_dim), 2, idx_expanded)
+        scores_win = torch.einsum('btd,btfd->btf', Q, K_win)  # [BH,Tq,F]
+        prior_win = positional_prior(idx_win, centers, tau=max(Fw / 4, 1.0))  # [Tq,F]
 
         if self.cfg.log_once_pairs and not self._printed_cfg:
             print(f"[QuAttn] heads={self.num_heads} F={Fw} "
-                  f"k={self.cfg.k_per_query} g={self.cfg.globals_per_head} t={self.cfg.teleports_per_head} "
-                  f"(win=greedy-diverse, glob=facility-location) is_decoder={self.is_decoder}")
+                f"k={self.cfg.k_per_query} g={self.cfg.globals_per_head} t={self.cfg.teleports_per_head} "
+                f"backends(win=greedy, glob=facility-location) "
+                f"is_decoder={self.is_decoder}")
             self._printed_cfg = True
+
 
         # ---- window selection (greedy) ----
         Tk = K.shape[1]
         g = int(self.cfg.globals_per_head)
         t = max(0, int(self.cfg.teleports_per_head))
 
+        # Desired M for short sequences only; capped to keep O(n)
         M_desired = max(g + t + 1, int(self.cfg.r_target_softmax * Tk))
-        k_here = max(self.cfg.min_k, min(self.cfg.max_k, M_desired - (g + t)))
-        k_here = min(k_here, Fw)
+        k_here = M_desired - (g + t)
+        k_here = max(self.cfg.min_k, min(self.cfg.max_k, k_here))
+        k_here = min(k_here, Fw)  # cannot exceed window size
 
-        sel_idx = self.window_selector.select_greedy(scores_win, prior_win, keys_win=K_win, k_override=k_here)  # [BH,Tq,k]
+        sel_idx = self.window_selector.select_greedy(scores_win, prior_win, keys_win=K_win, k_override=k_here)
         k = sel_idx.size(-1)
 
-        # Absolute indices for locals: gather from idx_win (small)
+        # Absolute indices for windows
         abs_idx_win = torch.gather(idx_win.unsqueeze(0).expand(BH, -1, -1), -1, sel_idx)  # [BH,Tq,k]
 
-        # ---- globals per head (greedy facility-location; amortized) ----
+        # ---- globals per head (QUBO; amortized) ----
         H = self.num_heads
         Qh = Q.view(H, bsz, tgt_len, self.head_dim)                # [H,B,Tq,d]
         q_summary = F_normalize_safe(Qh.mean(dim=1), dim=-1)       # [H,Tq,d]
@@ -408,51 +401,66 @@ class BiggerBird(BartAttention):
             )
             self.runtime.store_globals(getattr(self, "layer_idx", None), src_len, globals_per_head)
 
-        # ---- teleports per head (prototype-biased + uniform), vectorized ----
+        # ---- teleports per head (biased + uniform), force exactly t ----
         t = max(0, int(self.cfg.teleports_per_head))
-        # Build once per head
-        H = self.num_heads
-        head_slices = K.view(H, bsz, src_len, self.head_dim).mean(dim=1)   # [H,Tk,d]
-        Kbar = F.normalize(head_slices, dim=-1)                             # [H,Tk,d]
-        # q_summary: [H,Tq,d] already L2-normalized earlier
-        S_long = torch.relu(torch.matmul(Kbar, q_summary.transpose(1, 2)))  # [H,Tk,Tq]
-        u_long = S_long.mean(dim=-1)                                        # [H,Tk]
+        teleport_bias = float(self.cfg.teleport_bias_frac)
+        tele_list: List[torch.Tensor] = []
+        if t > 0:
+            tele_biased = int(round(t * teleport_bias))
+            tele_uniform = t - tele_biased
+            for h in range(H):
+                head_slice = K[h::H]                                   # [B,Tk,d]
+                Kbar = F.normalize(head_slice.mean(dim=0), dim=-1)      # [Tk,d]
+                qh = q_summary[h]                                       # [Tq,d]
+                u_long = torch.relu(torch.matmul(Kbar, qh.transpose(0, 1))).mean(dim=1)  # [Tk]
+                picks = []
+                if tele_biased > 0 and u_long.numel() > 0:
+                    k_top = min(tele_biased, u_long.numel())
+                    picks.append(torch.topk(u_long, k=k_top).indices)
+                if tele_uniform > 0:
+                    picks.append(torch.randint(low=0, high=src_len, size=(tele_uniform,), device=device))
+                tele = torch.unique(torch.cat(picks)) if picks else torch.empty(0, dtype=torch.long, device=device)
+                # top-off to exactly t
+                attempts = 0
+                while tele.numel() < t and attempts < 3:
+                    need = t - tele.numel()
+                    extra = torch.randint(low=0, high=src_len, size=(need,), device=device)
+                    tele = torch.unique(torch.cat([tele, extra]))
+                    attempts += 1
+                if tele.numel() > t:
+                    tele = tele[:t]
+                if tele.numel() < t:
+                    pad = (tele[:1].repeat(t - tele.numel())) if tele.numel() > 0 \
+                          else torch.zeros(t - tele.numel(), dtype=torch.long, device=device)
+                    tele = torch.cat([tele, pad], dim=0)
+                tele_list.append(tele.to(device))
+        else:
+            tele_list = [torch.empty(0, dtype=torch.long, device=device) for _ in range(H)]
 
-        tele_biased = int(round(t * float(self.cfg.teleport_bias_frac)))
-        tele_uniform = t - tele_biased
-        tele_list = []
-        for h in range(H):
-            picks = []
-            if tele_biased > 0:
-                picks.append(torch.topk(u_long[h], k=min(tele_biased, src_len)).indices)
-            if tele_uniform > 0:
-                picks.append(torch.randperm(src_len, device=device)[:tele_uniform])
-            tele = torch.cat(picks)[:t] if picks else torch.empty(0, dtype=torch.long, device=device)
-            tele_list.append(tele)
-
-
-        # ---- Build final absolute index tensor per head: [B,Tq,M] ----
+        # ---- Build final absolute index tensor per head: [B,Tq,k + g + t] ----
         abs_idx_list = []
+        g = int(self.cfg.globals_per_head)
         for h in range(H):
-            y = globals_per_head[h].to(device=device, dtype=torch.long)  # [g]
-            g_eff = int(self.cfg.globals_per_head)
-            if y.numel() < g_eff:
-                pad = (y[:1].repeat(g_eff - y.numel())) if y.numel() > 0 \
-                      else torch.zeros(g_eff - y.numel(), dtype=torch.long, device=device)
+            y = globals_per_head[h].to(device=device, dtype=torch.long)
+            # force exactly g
+            if y.numel() < g:
+                pad = (y[:1].repeat(g - y.numel())) if y.numel() > 0 \
+                      else torch.zeros(g - y.numel(), dtype=torch.long, device=device)
                 y = torch.cat([y, pad], dim=0)
-            elif y.numel() > g_eff:
-                y = y[:g_eff]
-            y_exp = y.view(1, 1, g_eff).expand(bsz, tgt_len, g_eff)      # [B,Tq,g]
+            elif y.numel() > g:
+                y = y[:g]
+            y_exp = y.view(1, 1, g).expand(bsz, tgt_len, g)
 
-            te = tele_list[h]
-            parts = [abs_idx_win[h*bsz:(h+1)*bsz], y_exp]
-            if te.numel() > 0:
-                te_exp = te.view(1, 1, -1).expand(bsz, tgt_len, -1)
-                parts.append(te_exp)
-            abs_idx_h = torch.cat(parts, dim=-1)                         # [B,Tq,M]
+            tele = tele_list[h]
+            if tele.numel() > 0:
+                tele_exp = tele.view(1, 1, t).expand(bsz, tgt_len, t)
+                parts = [abs_idx_win[h*bsz:(h+1)*bsz], y_exp, tele_exp]
+            else:
+                parts = [abs_idx_win[h*bsz:(h+1)*bsz], y_exp]
+            abs_idx_h = torch.cat(parts, dim=-1)  # [B,Tq,M]
             abs_idx_list.append(abs_idx_h)
 
-        # Ensure all heads share same M
+        # all heads must now share the same M
         M = abs_idx_list[0].size(-1)
         for i in range(1, len(abs_idx_list)):
             if abs_idx_list[i].size(-1) != M:
@@ -462,75 +470,77 @@ class BiggerBird(BartAttention):
 
         abs_idx = torch.cat(abs_idx_list, dim=0)  # [BH,Tq,M]
 
-        # ---- Final attention over selected tokens: flat batched gather ----
-        # K_sel, V_sel: built from absolute indices abs_idx [BH,Tq,M]
+        # ---- Final attention over selected tokens ----
         idx4 = abs_idx.view(BH, tgt_len, M, 1).expand(BH, tgt_len, M, self.head_dim)
-        K_sel = torch.gather(K.unsqueeze(1).expand(BH, tgt_len, src_len, self.head_dim), 2, idx4)  # [BH,Tq,M,d]
-        V_sel = torch.gather(V.unsqueeze(1).expand(BH, tgt_len, src_len, self.head_dim), 2, idx4)  # [BH,Tq,M,d]
+        K_sel = torch.gather(K.unsqueeze(1).expand(BH, tgt_len, src_len, self.head_dim), 2, idx4)
+        V_sel = torch.gather(V.unsqueeze(1).expand(BH, tgt_len, src_len, self.head_dim), 2, idx4)
+        scores_sel = torch.einsum('btd,btmd->btm', Q, K_sel)
 
-        # FIX: per-query dot product over d
-        scores_sel = (Q.unsqueeze(2) * K_sel).sum(-1)  # [BH,Tq,M]   (equivalent to einsum('btd,btmd->btm'))
-
-
-        # Softmax-comparison ratio (one-time log)
+        # log pairs (cost proxy) once
         if self.cfg.log_once_pairs and not self._logged_pairs:
-            BH_local = BH
-            Tk_local = K.shape[1]
+            # --- Softmax-comparison ratio (sparse vs full) ---
+            BH = bsz * self.num_heads
+            Tk = K.shape[1]
             M_now = abs_idx.size(-1)
-            comps_sparse = BH_local * tgt_len * M_now
-            comps_full_unmasked = BH_local * tgt_len * Tk_local
+
+            # logits "sent to softmax"
+            comps_sparse = BH * tgt_len * M_now                   # sparse
+            comps_full_unmasked = BH * tgt_len * Tk               # full (no masking)
+
             ratio_softmax = comps_sparse / max(1, comps_full_unmasked)
 
+            # Optional: account for padding/causal masks in the "full" baseline
             if attention_mask is not None:
                 am_bool = attention_mask if attention_mask.dtype == torch.bool else (attention_mask > -1e8)
-                if am_bool.dim() == 2:
-                    am_bool = am_bool[:, None, None, :]                       # [B,1,1,Tk]
-                    am_bool = am_bool.expand(bsz, 1, tgt_len, src_len)        # [B,1,Tq,Tk]
-                elif am_bool.dim() == 3:
-                    am_bool = am_bool.unsqueeze(1)                             # [B,1,Tq,Tk]
-                comps_full_masked = int(am_bool.sum().item()) * self.num_heads
-                ratio_softmax_eff = comps_sparse / max(1, comps_full_masked)
-                print(f"[softmax] sparse={comps_sparse:,} | full(unmasked)={comps_full_unmasked:,} "
-                      f"ratio={ratio_softmax:.4f} | full(masked)={comps_full_masked:,} eff_ratio={ratio_softmax_eff:.4f}")
+                if am_bool.dim() == 3:  # [B, Tq, Tk] -> [B, 1, Tq, Tk]
+                    am_bool = am_bool.unsqueeze(1)
+                if am_bool.dim() == 2:  # [B, Tk] -> [B, 1, 1, Tk]
+                    am_bool = am_bool[:, None, None, :]
+                am_bh_full = am_bool.expand(bsz, self.num_heads, tgt_len, Tk).reshape(BH, tgt_len, Tk)
+                comps_full_masked = int(am_bh_full.sum().item())  # how many logits are actually "active"
             else:
-                print(f"[softmax] sparse={comps_sparse:,} | full(unmasked)={comps_full_unmasked:,} "
-                      f"ratio={ratio_softmax:.4f}")
+                comps_full_masked = comps_full_unmasked
+
+            ratio_softmax_eff = comps_sparse / max(1, comps_full_masked)
+
+            print(
+                f"[softmax] sparse={comps_sparse:,}  |  full(unmasked)={comps_full_unmasked:,} "
+                f"ratio={ratio_softmax:.4f}  |  full(masked)={comps_full_masked:,} eff_ratio={ratio_softmax_eff:.4f}"
+)
             self._logged_pairs = True
 
-        # Apply attention mask without huge expands
+        # Apply attention mask (memory-safe)
         if attention_mask is not None:
             am_bool = attention_mask if attention_mask.dtype == torch.bool else (attention_mask > -1e8)
-            if am_bool.dim() == 3:   # [B,Tq,Tk] -> [B,1,Tq,Tk]
+            # normalize shapes: [B, 1, 1, Tk] or [B, 1, Tq, Tk]
+            if am_bool.dim() == 3:
                 am_bool = am_bool.unsqueeze(1)
-            if am_bool.dim() == 2:   # [B,Tk] -> [B,1,1,Tk]
-                am_bool = am_bool[:, None, None, :]
-            abs_idx_hb = abs_idx.view(self.num_heads, bsz, tgt_len, M)
+            if am_bool.dim() == 2:
+                am_bool = am_bool[:, None, None, :]  # [B,1,1,Tk]
+            # reshape indices by head to avoid BH×Tq×Tk expansion
+            abs_idx_hb = abs_idx.view(self.num_heads, bsz, tgt_len, M)  # [H,B,Tq,M]
             allowed_chunks = []
             for h in range(self.num_heads):
-                am_small = am_bool.expand(bsz, 1, tgt_len, src_len)   # view
+                # broadcast over head dimension lazily (no materialization)
+                am_small = am_bool.expand(bsz, 1, tgt_len, src_len)     # view
                 allowed_h = torch.gather(am_small, -1, abs_idx_hb[h].unsqueeze(1)).squeeze(1)  # [B,Tq,M]
                 allowed_chunks.append(allowed_h)
-            allowed = torch.cat(allowed_chunks, dim=0)                # [BH,Tq,M]
+            allowed = torch.cat(allowed_chunks, dim=0)  # [BH,Tq,M]
             scores_sel = scores_sel.masked_fill(~allowed, torch.finfo(scores_sel.dtype).min)
 
 
         # Softmax + dropout + output
-        attn_probs = F.softmax(scores_sel, dim=-1)            # [BH,Tq,M]
-        attn_probs = F.dropout(attn_probs, p=self.drop_p, training=self.training)
+        attn_probs = F.softmax(scores_sel, dim=-1)
+        drop_p = self.dropout.p if isinstance(self.dropout, nn.Dropout) else float(self.dropout)
+        attn_probs = F.dropout(attn_probs, p=drop_p, training=self.training)
 
-        BH_Tq = BH * tgt_len
-        out = torch.bmm(
-            attn_probs.reshape(BH_Tq, 1, M),                  # [BH*Tq,1,M]
-            V_sel.reshape(BH_Tq, M, self.head_dim)            # [BH*Tq,M,d]
-        ).reshape(BH, tgt_len, self.head_dim)                 # [BH,Tq,d]
-
-        attn_output = out.view(bsz, self.num_heads, tgt_len, self.head_dim) \
-                        .transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
+        attn_output = torch.einsum('btm,btmd->btd', attn_probs, V_sel)
+        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim) \
+                                 .transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
         attn_output = self.out_proj(attn_output)
 
-
         present_key_value = (key_states_full, value_states_full) if use_cache else None
-        attn_weights_reshaped = attn_probs.view(bsz, self.num_heads, tgt_len, abs_idx.size(-1)) if output_attentions else None
+        attn_weights_reshaped = attn_probs.view(bsz, self.num_heads, tgt_len, M) if output_attentions else None
 
         # Optional debug stats
         if self.cfg.debug_collect:
@@ -546,7 +556,7 @@ class BiggerBird(BartAttention):
                 if len(gl_sets) >= 2:
                     inter = set.intersection(*gl_sets); union = set.union(*gl_sets)
                     jacc = len(inter) / max(1, len(union))
-            self._debug_meta = {"M": abs_idx.size(-1), "mean_local_distance": mean_dist,
+            self._debug_meta = {"M": M, "mean_local_distance": mean_dist,
                                 "global_jaccard": jacc,
                                 "globals_h0": (globals_per_head[0].tolist() if self.cfg.globals_per_head > 0 else [])}
 
@@ -555,6 +565,7 @@ class BiggerBird(BartAttention):
 
 
 def patch_bart_with_biggerbird(model: nn.Module, cfg: RouterConfig) -> RouterRuntime:
+    # Try to detect total heads from encoder self-attn
     num_heads = None
     for mod in model.modules():
         if isinstance(mod, BartAttention) and (not getattr(mod, "is_decoder", False)):
@@ -577,6 +588,10 @@ def patch_bart_with_biggerbird(model: nn.Module, cfg: RouterConfig) -> RouterRun
     _recurse(model)
     return runtime
 
+
+# ===============================
+# HF Trainer wrapper
+# ===============================
 
 class BiggerBirdBartForSequenceClassification(nn.Module):
     def __init__(self, base_model: nn.Module, cfg: RouterConfig = default_router_config):
@@ -632,9 +647,33 @@ class BiggerBirdBartForSequenceClassification(nn.Module):
         base = AutoModelForSequenceClassification.from_pretrained(model_name_or_path)
         return cls(base, cfg)
 
+# classification.py
+# Compare BiggerBird-BART (sparse) vs BigBird on IMDB (long sequences)
+
+from dataclasses import dataclass
+import numpy as np
+import torch
+from datasets import load_dataset
+from sklearn.metrics import accuracy_score, f1_score
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    Trainer,
+    TrainingArguments,
+    DataCollatorWithPadding,
+    TrainerCallback,
+    set_seed,
+)
+from transformers.trainer_utils import EvalPrediction
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+from biggerbird_bart import BiggerBirdBartForSequenceClassification, RouterConfig
 
 # -------------------------------
-# Training / evaluation
+# Train / Router configs
 # -------------------------------
 
 @dataclass
@@ -645,15 +684,19 @@ class TrainConfig:
     seed: int = 42
     epochs: int = 3
 
+    # For 1k-token sequences, keep per-device batch small; use grad accumulation
     per_device_train_bs: int = 2
     per_device_eval_bs: int = 2
-    grad_accum_steps: int = 8
+    grad_accum_steps: int = 8          # effective batch ~= 16
 
     lr: float = 3e-5
     weight_decay: float = 0.01
     warmup_ratio: float = 0.06
-    max_length: int = 768
+    max_length: int = 1024             # long enough to trigger sparse benefits
+    use_fp16_if_cuda: bool = True
+    use_bf16_if_cuda: bool = True      # use BF16 on Ampere+ if available
 
+    # IMDB: 25k/25k; you can subselect for quick runs
     train_samples: int = 2000
     eval_samples: int = 1000
 
@@ -661,18 +704,21 @@ class TrainConfig:
 
 train_cfg = TrainConfig()
 
-# Router defaults (tuned for speed while keeping quality)
+# BiggerBird router config (long-context defaults)
 router_cfg = RouterConfig(
-    fragment_size=32,
-    k_per_query=6,
-    globals_per_head=3,
-    top_u=8,
-    proto_count=16,
-    teleports_per_head=1,
+    fragment_size=64,        # F (window)
+    k_per_query=8,           # k from F; << BigBird's ~448 local tokens
+    globals_per_head=4,      # g
+    top_u=16,                # expand to 16 candidates before greedy
+    proto_count=32,          # query prototypes for facility-location
+    teleports_per_head=2,
     teleport_bias_frac=0.5,
     keynorm_exponent=0.0,
-    share_stride_layers=2,
 )
+
+# -------------------------------
+# Utilities
+# -------------------------------
 
 def compute_metrics(eval_pred):
     if isinstance(eval_pred, EvalPrediction):
@@ -706,20 +752,18 @@ def build_imdb_dataset(tokenizer, max_length: int):
 def device_flags():
     use_cuda = torch.cuda.is_available()
     use_mps = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
-    # On MPS: keep precision FP32, avoid compile/checkpointing, keep workers=0
-    fp16 = False
-    bf16 = False
-    torch_compile = False
-    pin_mem = False
-    if use_cuda:
-        fp16 = True
-        bf16 = torch.cuda.is_bf16_supported()
-        torch_compile = False  # training compile often brings regressions; leave off
-        pin_mem = True
-    return fp16, bf16, torch_compile, pin_mem, use_mps
+    fp16 = bool(train_cfg.use_fp16_if_cuda and use_cuda)
+    bf16 = bool(train_cfg.use_bf16_if_cuda and use_cuda and torch.cuda.is_bf16_supported())
+    # On MPS, keep fp16/bf16 off; kernels are still finicky with long seqs
+    if use_mps:
+        fp16 = False
+        bf16 = False
+    torch_compile = bool(use_cuda)  # generally safe; disable on MPS
+    pin_mem = bool(use_cuda)        # keep False on MPS/CPU
+    return fp16, bf16, torch_compile, pin_mem
 
 def make_args(out_dir: str) -> TrainingArguments:
-    fp16, bf16, torch_compile, pin_mem, use_mps = device_flags()
+    fp16, bf16, torch_compile, pin_mem = device_flags()
     return TrainingArguments(
         output_dir=out_dir,
         num_train_epochs=train_cfg.epochs,
@@ -731,31 +775,35 @@ def make_args(out_dir: str) -> TrainingArguments:
         warmup_ratio=train_cfg.warmup_ratio,
         logging_strategy="steps",
         logging_steps=20,
-        eval_strategy="no",
+        eval_strategy="no",                 # evaluate explicitly after training
         save_strategy="no",
         report_to="none",
         fp16=fp16,
         bf16=bf16,
-        remove_unused_columns=False,
-        dataloader_num_workers=0,       # macOS best: 0
-        dataloader_pin_memory=False,  # False on MPS/CPU
-        gradient_checkpointing=False,   # off on MPS
-        torch_compile=torch_compile,    # off on MPS
+        remove_unused_columns=False,        # we pass all columns already
+        dataloader_num_workers=2,           # low for macOS
+        dataloader_pin_memory=pin_mem,
+        gradient_checkpointing=True,
+        torch_compile=torch_compile,
+        # padding multiple helps Flash/blocks; harmless otherwise
         optim="adamw_torch",
     )
 
+# Robust BigBird tokenizer (avoid slow->fast conversion path)
 def load_bigbird_tok(model_name: str):
     try:
         from transformers import BigBirdTokenizer
-        return BigBirdTokenizer.from_pretrained(model_name)  # stable slow tokenizer
+        return BigBirdTokenizer.from_pretrained(model_name)  # slow, stable
     except Exception as e_slow:
         print(f"[BigBird] slow tokenizer failed: {e_slow}\nTrying fast tokenizer...", flush=True)
         return AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
+# -------------------------------
+# Trainers
+# -------------------------------
+
 def train_and_eval_biggerbird(tokenizer, ds):
-    from transformers import AutoModelForSequenceClassification
-    base = AutoModelForSequenceClassification.from_pretrained(train_cfg.bart_name, num_labels=2)
-    model = BiggerBirdBartForSequenceClassification(base_model=base, cfg=router_cfg)
+    model = BiggerBirdBartForSequenceClassification.from_pretrained(train_cfg.bart_name, cfg=router_cfg)
     collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=64)
     args = make_args("./biggerbird-out")
 
@@ -779,7 +827,9 @@ def train_and_eval_biggerbird(tokenizer, ds):
     eval_res = trainer.evaluate()
     print(eval_res)
 
+    # Optional: peek one encoder layer's debug meta
     if train_cfg.show_debug_meta:
+        from biggerbird_bart import BiggerBird
         for n, m in model.model.named_modules():
             if isinstance(m, BiggerBird) and not m.is_decoder and hasattr(m, "_debug_meta"):
                 print("[debug_meta]", n, m._debug_meta)
@@ -813,14 +863,18 @@ def train_and_eval_bigbird(tokenizer, ds):
     print(eval_res)
     return eval_res
 
+# -------------------------------
+# Main
+# -------------------------------
+
 def main():
     set_seed(train_cfg.seed)
 
-    # BART tokenizer
+    # BART tokenizer (fast OK)
     bart_tok = AutoTokenizer.from_pretrained(train_cfg.bart_name, use_fast=True)
     ds_bart = build_imdb_dataset(bart_tok, train_cfg.max_length)
 
-    # BigBird tokenizer (prefer slow)
+    # BigBird tokenizer: prefer slow to avoid Tiktoken conversion glitches
     bigbird_tok = load_bigbird_tok(train_cfg.bigbird_name)
     ds_bigbird = build_imdb_dataset(bigbird_tok, train_cfg.max_length)
 
