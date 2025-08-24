@@ -11,6 +11,8 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 import os
+from transformers.modeling_outputs import SequenceClassifierOutput
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import numpy as np
@@ -47,18 +49,18 @@ class RouterConfig:
     patch_encoder_only: bool = True
 
     # Candidate construction
-    fragment_size: int = 32      # window size Fw — clamped to src_len
-    k_per_query: int = 6         # locals picked from the window
-    globals_per_head: int = 3    # g per head
+    fragment_size: int = 64      # window size Fw — clamped to src_len
+    k_per_query: int = 24         # locals picked from the window
+    globals_per_head: int = 6    # g per head
 
     # Softmax target fraction (controls k on short sequences)
-    r_target_softmax: float = 0.08
-    min_k: int = 6
-    max_k: int = 14
+    r_target_softmax: float = 0.12
+    min_k: int = 48
+    max_k: int = 48
 
     # Teleports
-    teleports_per_head: int = 1
-    teleport_bias_frac: float = 0.5
+    teleports_per_head: int = 3
+    teleport_bias_frac: float = 0.75
 
     # Utility shaping for globals (facility-location proxy)
     w_mean: float = 1.0
@@ -69,16 +71,16 @@ class RouterConfig:
     keynorm_exponent: float = 0.0
 
     # Scoring blend / locals
-    alpha_pos_prior: float = 0.2
-    gamma_diversity: float = 0.2   # diversity penalty
+    alpha_pos_prior: float = 0.15
+    gamma_diversity: float = 0.25   # diversity penalty
 
     # Globals (prefilter + prototypes)
-    top_u: int = 8                 # per-head prefilter size U
-    proto_count: int = 16          # query prototypes p (<= Tq)
+    top_u: int = 16                 # per-head prefilter size U
+    proto_count: int = 24          # query prototypes p (<= Tq)
 
     # Blocked-MMR params
-    mmr_prefilter_mult: float = 4.0   # candidates = min(Fw, ceil(mult*k))
-    mmr_diversity_steps: int = 2      # number of diversity rounds (≈MMR)
+    mmr_prefilter_mult: float = 3   # candidates = min(Fw, ceil(mult*k))
+    mmr_diversity_steps: int = 7      # number of diversity rounds (≈MMR)
 
     # Amortization
     share_stride_layers: int = 2      # reuse globals across adjacent layers
@@ -91,8 +93,35 @@ class RouterConfig:
     debug_collect: bool = False
     log_once_pairs: bool = True
 
-
 default_router_config = RouterConfig()
+
+router_cfg = RouterConfig(
+    fragment_size=128,          # slightly tighter window → cleaner local top-k
+    r_target_softmax=0.16,      # ensures k hits max_k at 896 tokens
+    min_k=56,
+    max_k=64,                   # locals per query (main quality driver)
+    globals_per_head=6,
+    teleports_per_head=4,       # a tiny bump helps long-range without much cost
+    teleport_bias_frac=0.75,
+
+    top_u=32,
+    proto_count=48,
+
+    mmr_prefilter_mult=3.0,
+    mmr_diversity_steps=2,      # ↓ from 7 → less over-diversification, higher precision
+    gamma_diversity=0.16,       # moderate penalty works best with steps=2
+
+    alpha_pos_prior=0.12,       # restore a useful locality bias for IMDB
+    share_stride_layers=2,
+
+    dense_fallback_under=512,
+    random_selection=False,
+    debug_collect=False,
+    log_once_pairs=True,
+)
+
+
+
 
 
 class RouterRuntime:
@@ -194,63 +223,61 @@ class GlobalChooser:
         return torch.round(torch.linspace(0, Tq - 1, steps=p, device=device)).long()
 
     def choose_packed(self, key_states: torch.Tensor, q_summary: torch.Tensor,
-                      bsz: int, num_heads: int, g_eff: int) -> List[torch.Tensor]:
+                    bsz: int, num_heads: int, g_eff: int) -> List[torch.Tensor]:
         """
-        key_states: [BH, Tk, d], q_summary: [H, Tq, d] (L2-normalized)
-        returns per-head LongTensor[g_eff]
+        key_states: [BH, Tk, d]
+        q_summary:  [H, B, Tq, d]  (per-example query summary; caller will pass this)
+        returns: list length H, each [B, g_eff] LongTensor (absolute positions)
         """
         device = key_states.device
         H = num_heads
-        U_target = max(1, int(self.cfg.top_u))
-        p = max(1, int(self.cfg.proto_count))
-
         BH, Tk, d = key_states.shape
-        Kmean = key_states.view(H, bsz, Tk, d).mean(dim=1)      # [H, Tk, d]
-        Kbar  = F_normalize_safe(Kmean, dim=-1)                 # [H, Tk, d]
+        KHB = key_states.view(H, bsz, Tk, d)                     # [H,B,Tk,d]
+        Kbar = F_normalize_safe(KHB, dim=-1)                     # [H,B,Tk,d]
 
-        Tq = q_summary.size(1)
-        idxp = self._proto_idx(Tq, p, device)                   # [p']
-        Qp = q_summary.index_select(1, idxp)                    # [H, p', d]
+        # Prototypes per example
+        H_, B_, Tq, d_ = q_summary.shape
+        assert H_ == H and B_ == bsz and d_ == d
+        p = max(1, int(self.cfg.proto_count))
+        idxp = self._proto_idx(Tq, p, device)                    # [p']
+        Qp = q_summary.index_select(2, idxp)                     # [H,B,p',d]
 
-        # Prototype coverage per head token
-        S = torch.relu(torch.einsum('hkd,hpd->hkp', Kbar, Qp))  # [H,Tk,p']
-        mean = S.mean(dim=-1)
-        mx   = S.max(dim=-1).values
-        kq   = max(1, int(round(S.size(-1) * self.cfg.topk_frac)))
-        topk_mean = torch.topk(S, k=kq, dim=-1).values.mean(dim=-1)
-        std  = S.std(dim=-1)
+        # Similarity: [H,B,Tk,p']
+        S = torch.relu(torch.einsum('hbkd, hbpd -> hbkp', Kbar, Qp))
 
-        u_full = (self.cfg.w_mean * mean + self.cfg.w_max * mx
-                  + self.cfg.w_topk * topk_mean + self.cfg.w_std * std)  # [H,Tk]
+        # Prefilter score per token: [H,B,Tk]
+        mean = S.mean(-1); mx = S.max(-1).values
+        kq = max(1, int(round(S.size(-1) * self.cfg.topk_frac)))
+        topk_mean = torch.topk(S, k=kq, dim=-1).values.mean(-1)
+        std = S.std(-1)
+        u_full = (self.cfg.w_mean*mean + self.cfg.w_max*mx
+                + self.cfg.w_topk*topk_mean + self.cfg.w_std*std)  # [H,B,Tk]
 
-        if self.cfg.keynorm_exponent != 0.0:
-            kn = Kmean.norm(dim=-1).clamp_min(1e-6)
-            u_full = u_full * (kn / kn.mean(dim=1, keepdim=True)).pow(self.cfg.keynorm_exponent)
+        U = int(min(max(1, int(self.cfg.top_u)), Tk))
+        # top-U per (h,b)
+        u_vals, top_idx = torch.topk(u_full, k=U, dim=-1)            # [H,B,U]
+        # Restrict S to those candidates
+        idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, -1, S.size(-1))
+        S_sub = torch.gather(S, dim=2, index=idx_exp)                # [H,B,U,p']
 
-        U = int(min(U_target, Tk))
-        U = max(g_eff, min(U, Tk))  # ensure enough for greedy
-
-        u_vals, top_idx = torch.topk(u_full, k=U, dim=1)  # [H,U]
-        S_sub = torch.gather(S, dim=1, index=top_idx.unsqueeze(-1).expand(-1, -1, S.size(-1)))  # [H,U,p']
-
-        # Greedy facility-location on S_sub
-        H_range = torch.arange(H, device=device)
+        # Greedy FL per (h,b)
         p_eff = S_sub.size(-1)
-        m = torch.zeros(H, p_eff, device=device, dtype=S_sub.dtype)
-        blocked = torch.zeros(H, U, device=device, dtype=torch.bool)
-        chosen_local = torch.zeros(H, g_eff, device=device, dtype=torch.long)
+        m = torch.zeros(H, bsz, p_eff, device=device, dtype=S_sub.dtype)
+        blocked = torch.zeros(H, bsz, U, device=device, dtype=torch.bool)
+        chosen_local = torch.zeros(H, bsz, g_eff, device=device, dtype=torch.long)
 
         steps = min(g_eff, U)
         for r in range(steps):
-            gains = torch.relu(S_sub - m.unsqueeze(1)).sum(dim=-1)  # [H,U]
+            gains = torch.relu(S_sub - m.unsqueeze(2)).sum(dim=-1)   # [H,B,U]
             gains = gains.masked_fill(blocked, -1e9)
-            j = gains.argmax(dim=1)                                 # [H]
-            chosen_local[:, r] = j
-            blocked[H_range, j] = True
-            m = torch.maximum(m, S_sub[H_range, j, :])
+            j = gains.argmax(dim=-1)                                 # [H,B]
+            chosen_local[:, :, r] = j
+            blocked.scatter_(2, j.unsqueeze(-1), True)
+            m = torch.maximum(m, S_sub[torch.arange(H)[:,None], torch.arange(bsz)[None,:], j, :])
 
-        chosen_abs = torch.gather(top_idx, dim=1, index=chosen_local)  # [H,g_eff]
-        return [chosen_abs[h].to(device=device, dtype=torch.long) for h in range(H)]
+        chosen_abs = torch.gather(top_idx, dim=2, index=chosen_local)   # [H,B,g_eff]
+        return [chosen_abs[h] for h in range(H)]                         # list of [B,g_eff]
+
 
 
 class WindowSelector:
@@ -448,6 +475,7 @@ class BiggerBird(BartAttention):
         mode = "cross" if is_cross_attention else ("decoder" if self.is_decoder else "encoder")
         idx_win, prior_win = self._get_idx_and_prior(tgt_len, src_len, Fw, device, mode)
 
+
         # ---- LOCALS: sliding K_win (no huge expand)
         with torch.no_grad():
             if is_cross_attention:
@@ -457,7 +485,10 @@ class BiggerBird(BartAttention):
                 K_win = sliding_window_view_seq(K, Fw=Fw, causal=bool(self.is_decoder))  # [BH,Tq,Fw,d]
 
             # scores for locals
-            scores_win = torch.matmul(Q.unsqueeze(2), K_win.transpose(-1, -2)).squeeze(2)  # [BH,Tq,Fw]
+            Qn = F_normalize_safe(Q, dim=-1).unsqueeze(2)          # [BH,Tq,1,d]
+            Kn = F_normalize_safe(K_win, dim=-1).transpose(-1, -2) # [BH,Tq,d,Fw]
+            scores_win = torch.matmul(Qn, Kn).squeeze(2)           # [BH,Tq,Fw]
+
 
             if self.cfg.log_once_pairs and not self._printed_cfg:
                 print(f"[QuAttn] heads={self.num_heads} F={Fw} "
@@ -486,6 +517,34 @@ class BiggerBird(BartAttention):
             M_desired = max(g_eff + t_eff + 1, int(self.cfg.r_target_softmax * Tk))
             k_here = max(self.cfg.min_k, min(self.cfg.max_k, M_desired - (g_eff + t_eff)))
             k_here = min(k_here, Fw)
+
+            # After: scores_win = ...  # [BH, Tq, Fw]
+            if attention_mask is not None:
+                # Normalize to a boolean "allowed" mask shaped [B, Tq, Tk]
+                if attention_mask.dtype == torch.bool:
+                    if attention_mask.dim() == 2:               # [B, Tk]
+                        am_small = attention_mask.unsqueeze(1).expand(bsz, tgt_len, src_len)
+                    elif attention_mask.dim() == 4:             # [B, 1, Tq, Tk]
+                        am_small = attention_mask.squeeze(1)    # -> [B, Tq, Tk]
+                    else:                                       # assume [B, Tq, Tk]
+                        am_small = attention_mask
+                else:
+                    # additive mask: 0 allowed, -inf disallowed (Bart uses additive)
+                    if attention_mask.dim() == 4:               # [B, 1, Tq, Tk]
+                        am_small = torch.isfinite(attention_mask).squeeze(1)  # True=allowed
+                    elif attention_mask.dim() == 2:             # [B, Tk]
+                        am_small = (attention_mask > 0).unsqueeze(1).expand(bsz, tgt_len, src_len)
+                    else:                                       # assume [B, Tq, Tk]
+                        am_small = torch.isfinite(attention_mask)
+
+                # Gather into the window: idx_win [Tq, Fw] -> [B, Tq, Fw]
+                idx_btf = idx_win.unsqueeze(0).expand(bsz, -1, -1)
+                mask_win = torch.gather(am_small, -1, idx_btf)  # [B, Tq, Fw]
+
+                # Expand to BH and apply
+                mask_win_bh = mask_win.unsqueeze(1).expand(bsz, self.num_heads, tgt_len, Fw).reshape(BH, tgt_len, Fw)
+                scores_win = scores_win.masked_fill(~mask_win_bh, torch.finfo(scores_win.dtype).min)
+
 
             sel_idx = self.window_selector.select_blocked_mmr(
                 scores_win=scores_win, prior_win=prior_win, keys_win=K_win, k_target=k_here
@@ -531,20 +590,31 @@ class BiggerBird(BartAttention):
                     tele_list.append(tele)
             else:
                 tele_list = [torch.empty(0, dtype=torch.long, device=device) for _ in range(H)]
+    
+            # --- always-global anchors (CLS and EOS) ---
+            if attention_mask is not None and attention_mask.dim() == 2:  # [B,T]
+                lens = attention_mask.long().sum(dim=1).clamp(min=1)
+                eos_idx_b = (lens - 1)  # last non-pad per batch
+            else:
+                eos_idx_b = torch.full((bsz,), tgt_len - 1, device=device, dtype=torch.long)
+            cls_idx_b = torch.zeros(bsz, dtype=torch.long, device=device)
+
+            cls_exp = cls_idx_b.view(bsz, 1).unsqueeze(1).expand(bsz, tgt_len, 1)  # [B,Tq,1]
+            eos_exp = eos_idx_b.view(bsz, 1).unsqueeze(1).expand(bsz, tgt_len, 1)  # [B,Tq,1]
 
             # ---- Build final absolute index tensor per head: [B,Tq,M] ----
             abs_idx_list = []
             for h in range(H):
                 y = globals_per_head[h].to(device=device, dtype=torch.long)  # [g_eff]
                 y_exp = y.view(1, 1, -1).expand(bsz, tgt_len, -1)            # [B,Tq,g_eff]
-                parts = [abs_idx_win[h*bsz:(h+1)*bsz], y_exp]
+                parts = [abs_idx_win[h*bsz:(h+1)*bsz], y_exp, cls_exp, eos_exp]
                 te = tele_list[h]
                 if te.numel() > 0:
                     te_exp = te.view(1, 1, -1).expand(bsz, tgt_len, -1)
                     parts.append(te_exp)
                 abs_idx_h = torch.cat(parts, dim=-1)                         # [B,Tq,M]
                 abs_idx_list.append(abs_idx_h)
-
+            
             # Ensure all heads share same M
             M = abs_idx_list[0].size(-1)
             for i in range(1, len(abs_idx_list)):
@@ -554,6 +624,11 @@ class BiggerBird(BartAttention):
                     abs_idx_list[i] = torch.cat([abs_idx_list[i], pad], dim=-1)
 
             abs_idx = torch.cat(abs_idx_list, dim=0)  # [BH,Tq,M]
+
+            if self.cfg.log_once_pairs and not hasattr(self, "_printed_M"):
+                M = abs_idx.size(-1)
+                print(f"[router] Tk={K.shape[1]} Fw={Fw} k_here={k_here} g_eff={g_eff} t_eff={t_eff} M={M}")
+                self._printed_M = True
 
         # ---- Final attention over selected tokens: flat batched gather ----
         K_sel = flat_batched_gather_kv(K, abs_idx)  # [BH,Tq,M,d]
@@ -675,21 +750,44 @@ class BiggerBirdBartForSequenceClassification(nn.Module):
         token_type_ids=None,
         output_attentions=None,
         output_hidden_states=None,
-        return_dict=None,
+        return_dict=True,
         **kwargs,
     ):
+        # patch lifetime
         self.runtime.begin_forward()
         try:
+            # don't let HF pass extras we don't use
             kwargs.pop("token_type_ids", None)
             kwargs.pop("num_items_in_batch", None)
-            return self.model(
+
+            # run the BART backbone (patched with BiggerBird) to get last hidden states
+            outputs = self.model.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                labels=labels,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
+                return_dict=True,
             )
+            last_hidden = outputs.last_hidden_state   # [B, T, D]
+
+            # build a mask if none provided
+            if attention_mask is None:
+                if input_ids is not None and self.model.config.pad_token_id is not None:
+                    attention_mask = (input_ids != self.model.config.pad_token_id).long()
+                else:
+                    attention_mask = torch.ones(last_hidden.size()[:2], device=last_hidden.device, dtype=torch.long)
+
+            # === masked mean pooling over tokens (pads excluded) ===
+            mask = attention_mask.unsqueeze(-1)                     # [B, T, 1]
+            summed = (last_hidden * mask).sum(dim=1)                # [B, D]
+            denom = mask.sum(dim=1).clamp_min(1)                    # [B, 1]
+            pooled = summed / denom                                 # [B, D]
+
+            # same classification head as BartForSequenceClassification
+            logits = self.model.classification_head(pooled)
+
+            # Let Trainer handle label smoothing if configured → don't return a custom loss
+            return SequenceClassifierOutput(logits=logits)
         finally:
             self.runtime.end_forward()
 
@@ -720,12 +818,12 @@ class TrainConfig:
     per_device_eval_bs: int = 2
     grad_accum_steps: int = 8
 
-    lr: float = 3e-5
+    lr: float = 2e-5
     weight_decay: float = 0.01
-    warmup_ratio: float = 0.06
+    warmup_ratio: float = 0.10
     max_length: int = 768
 
-    train_samples: int = 2000
+    train_samples: int = 2000 #6k for overnight
     eval_samples: int = 1000
 
     show_debug_meta: bool = True
@@ -733,20 +831,126 @@ class TrainConfig:
 train_cfg = TrainConfig()
 
 # Router defaults (tuned for speed while keeping quality)
-router_cfg = RouterConfig(
-    fragment_size=32,
-    k_per_query=6,
-    globals_per_head=3,
-    top_u=8,
-    proto_count=16,
-    teleports_per_head=1,
-    teleport_bias_frac=0.5,
-    keynorm_exponent=0.0,
-    share_stride_layers=2,
-    mmr_prefilter_mult=4.0,
-    mmr_diversity_steps=2,
-    dense_fallback_under=512,
-)
+from transformers import TrainerCallback
+
+class RouterAnnealCallback(TrainerCallback):
+    def __init__(self, model, start_frac=0.16, end_frac=0.12, warmup_steps=80,
+                 start_max_k=28, end_max_k=24):
+        self.model = model
+        self.start_frac = start_frac
+        self.end_frac = end_frac
+        self.warmup_steps = warmup_steps
+        self.start_max_k = start_max_k
+        self.end_max_k = end_max_k
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        step = state.global_step
+        if step <= self.warmup_steps:
+            t = step / max(1, self.warmup_steps)
+            frac = self.start_frac + t * (self.end_frac - self.start_frac)
+            max_k = int(round(self.start_max_k + t * (self.end_max_k - self.start_max_k)))
+            # update all BiggerBird modules
+            for m in self.model.model.modules():
+                if isinstance(m, BiggerBird):
+                    m.cfg.r_target_softmax = frac
+                    m.cfg.max_k = max_k
+# --- Put this near your other callbacks ---
+from transformers import TrainerCallback
+
+def _set_router_density(model, r, max_k):
+    for m in model.model.modules():
+        if isinstance(m, BiggerBird):
+            m.cfg.r_target_softmax = float(r)
+            m.cfg.max_k = int(max_k)
+
+class FirstEpochRouterDensity(TrainerCallback):
+    """
+    Epoch 0: r_target_softmax=first_r, max_k=first_max_k
+    Epoch 1+: r_target_softmax=rest_r,  max_k=rest_max_k
+    """
+    def __init__(self, model, first_r=0.14, first_max_k=28, rest_r=0.12, rest_max_k=24):
+        self.model = model
+        self.first_r = first_r
+        self.first_max_k = first_max_k
+        self.rest_r = rest_r
+        self.rest_max_k = rest_max_k
+        self._epoch_idx = -1
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        # Ensure we start dense before the first forward
+        _set_router_density(self.model, self.first_r, self.first_max_k)
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        self._epoch_idx += 1
+        if self._epoch_idx == 0:
+            _set_router_density(self.model, self.first_r, self.first_max_k)
+        else:
+            _set_router_density(self.model, self.rest_r, self.rest_max_k)
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        # Make sure eval happens at the "rest" density
+        _set_router_density(self.model, self.rest_r, self.rest_max_k)
+
+# --- EMA that is device/dtype safe (MPS-friendly) ---
+class EMACallback(TrainerCallback):
+    def __init__(self, model, decay=0.999):
+        self.model = model                # pass the *HF* model, e.g. model.model
+        self.decay = float(decay)
+        self.shadow = {}
+        self._backup = {}
+
+    @torch.no_grad()
+    def on_train_begin(self, args, state, control, **kwargs):
+        # Create shadows on the current param devices/dtypes
+        self.shadow.clear()
+        for n, p in self.model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = p.detach().clone().to(device=p.device, dtype=p.dtype)
+
+    @torch.no_grad()
+    def on_step_end(self, args, state, control, **kwargs):
+        # Keep shadow in sync with param device/dtype and update EMA
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            s = self.shadow.get(n)
+            if (s is None) or (s.shape != p.data.shape) or (s.device != p.device) or (s.dtype != p.data.dtype):
+                s = p.detach().clone().to(device=p.device, dtype=p.dtype)
+                self.shadow[n] = s
+            s.mul_(self.decay).add_(p.data, alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def _swap_to_shadow(self):
+        self._backup = {}
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            self._backup[n] = p.data.detach().clone()
+            p.data.copy_(self.shadow[n])  # already correct device/dtype
+
+    @torch.no_grad()
+    def _swap_back(self):
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            p.data.copy_(self._backup[n])
+
+    # Use EMA weights for eval/save, then swap back
+    def on_evaluate(self, args, state, control, **kwargs):
+        self._swap_to_shadow()
+
+    def on_evaluate_end(self, args, state, control, **kwargs):
+        self._swap_back()
+
+    def on_save(self, args, state, control, **kwargs):
+        # ensure checkpoints save EMA weights if save happens outside evaluate()
+        if not self._backup:
+            self._swap_to_shadow()
+
+    def on_save_end(self, args, state, control, **kwargs):
+        if self._backup:
+            self._swap_back()
+
 
 def compute_metrics(eval_pred):
     # With preprocess_logits_for_metrics, predictions are class indices (np array)
@@ -801,9 +1005,11 @@ def make_args(out_dir: str) -> TrainingArguments:
         learning_rate=train_cfg.lr,
         weight_decay=train_cfg.weight_decay,
         warmup_ratio=train_cfg.warmup_ratio,
+        lr_scheduler_type="cosine",        # smoother for short runs
+        max_grad_norm=1.0,                 # optional: tighter clip if spikes persist
         logging_strategy="steps",
         logging_steps=20,
-        eval_strategy="no",
+        eval_strategy="epoch",
         save_strategy="no",
         report_to="none",
         fp16=fp16,
@@ -814,8 +1020,8 @@ def make_args(out_dir: str) -> TrainingArguments:
         gradient_checkpointing=False,   # off on MPS
         torch_compile=torch_compile,    # off on MPS
         optim="adamw_torch",
-        max_grad_norm=1.0,
         eval_accumulation_steps=eval_accum,
+        label_smoothing_factor=0.05,
     )
 
 def load_bigbird_tok(model_name: str):
@@ -831,7 +1037,7 @@ def summarize_token_selection_configs(router_cfg: RouterConfig, bigbird_model_na
     # BiggerBird
     print(
         "BiggerBird (ours): "
-        f"Fw={router_cfg.fragment_size}, k∈[{router_cfg.min_k},{router_cfg.max_k}] "
+        f"Fw={router_cfg.fragment_size}, k e [{router_cfg.min_k},{router_cfg.max_k}] "
         f"(target={router_cfg.r_target_softmax:.2f}·Tk), globals/head={router_cfg.globals_per_head}, "
         f"teleports/head={router_cfg.teleports_per_head}, prototypes p={router_cfg.proto_count}, prefilter U={router_cfg.top_u}"
     )
@@ -859,11 +1065,31 @@ def preprocess_logits_for_metrics(logits, labels):
 def train_and_eval_biggerbird(tokenizer, ds):
     from transformers import AutoModelForSequenceClassification
     base = AutoModelForSequenceClassification.from_pretrained(train_cfg.bart_name, num_labels=2)
+    # right after loading base
+    base.config.classifier_dropout = 0.1
+
     model = BiggerBirdBartForSequenceClassification(base_model=base, cfg=router_cfg)
     collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=64)
     args = make_args("./biggerbird-out")
 
-    callback = TrainerCallback()
+    # ---- Replace these two instantiations in train_and_eval_biggerbird(...) ----
+
+    anneal_epoch0 = FirstEpochRouterDensity(
+        model,
+        first_r=0.18, first_max_k=72,   # epoch 0: a bit denser to stabilize training
+        rest_r=0.15,  rest_max_k=64,    # epochs 1+: target regime
+    )
+
+    anneal_within = RouterAnnealCallback(
+        model,
+        start_frac=0.20, end_frac=0.15, # r schedule just needs to be ≥ ~0.12 so k hits max_k
+        warmup_steps=150,               # spread over ~first 150 steps
+        start_max_k=80, end_max_k=64,   # within-epoch warmup -> target k
+    )
+
+
+    ema_cb = EMACallback(model)
+    cb = TrainerCallback()
     trainer = Trainer(
         model=model,
         args=args,
@@ -872,7 +1098,7 @@ def train_and_eval_biggerbird(tokenizer, ds):
         tokenizer=tokenizer,
         data_collator=collator,
         compute_metrics=compute_metrics,
-        callbacks=[callback],
+        callbacks=[cb],
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
 
@@ -926,6 +1152,7 @@ def main():
     summarize_token_selection_configs(router_cfg, train_cfg.bigbird_name)
 
     # Force BigBird to fixed len ≥ 704 and multiple of 64 (avoid dense fallback in HF BigBird)
+    train_cfg.max_length = 896
     min_len = 704
     fixed_len = max(min_len, train_cfg.max_length)
     fixed_len = (fixed_len + 63) // 64 * 64  # align to 64
