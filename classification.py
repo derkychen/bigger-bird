@@ -60,7 +60,7 @@ class RouterConfig:
 
     # Teleports
     teleports_per_head: int = 3
-    teleport_bias_frac: float = 0.75
+    teleport_bias_frac: float = 0.4
 
     # Utility shaping for globals (facility-location proxy)
     w_mean: float = 1.0
@@ -226,57 +226,75 @@ class GlobalChooser:
                     bsz: int, num_heads: int, g_eff: int) -> List[torch.Tensor]:
         """
         key_states: [BH, Tk, d]
-        q_summary:  [H, B, Tq, d]  (per-example query summary; caller will pass this)
+        q_summary:  either [H, Tq, d]  (legacy, batch-averaged)
+                    or     [H, B, Tq, d] (per-example)
+                    Caller should migrate to [H,B,Tq,d].
         returns: list length H, each [B, g_eff] LongTensor (absolute positions)
         """
         device = key_states.device
         H = num_heads
         BH, Tk, d = key_states.shape
-        KHB = key_states.view(H, bsz, Tk, d)                     # [H,B,Tk,d]
-        Kbar = F_normalize_safe(KHB, dim=-1)                     # [H,B,Tk,d]
+
+        # Reshape keys per head and per example
+        KHB = key_states.view(H, bsz, Tk, d)                       # [H,B,Tk,d]
+        Kbar = F_normalize_safe(KHB, dim=-1)                       # [H,B,Tk,d]
+
+        # --- Normalize & shape q_summary to [H,B,Tq,d] ---
+        if q_summary.dim() == 3:                                   # [H,Tq,d] -> broadcast over batch
+            H_, Tq, d_ = q_summary.shape
+            assert H_ == H and d_ == d, f"q_summary dims mismatch: got {q_summary.shape}, expected H={H}, d={d}"
+            q_summary = q_summary.unsqueeze(1).expand(H, bsz, Tq, d)  # [H,B,Tq,d]
+        elif q_summary.dim() == 4:                                 # [H,B,Tq,d]
+            H_, B_, Tq, d_ = q_summary.shape
+            assert H_ == H and B_ == bsz and d_ == d, \
+                f"q_summary dims mismatch: got {q_summary.shape}, expected [H={H}, B={bsz}, Tq, d={d}]"
+        else:
+            raise ValueError(f"q_summary must be 3D or 4D, got shape {q_summary.shape}")
 
         # Prototypes per example
-        H_, B_, Tq, d_ = q_summary.shape
-        assert H_ == H and B_ == bsz and d_ == d
         p = max(1, int(self.cfg.proto_count))
-        idxp = self._proto_idx(Tq, p, device)                    # [p']
-        Qp = q_summary.index_select(2, idxp)                     # [H,B,p',d]
+        idxp = self._proto_idx(Tq, p, device)                      # [p']
+        Qp = q_summary.index_select(2, idxp)                       # [H,B,p',d]
+        Qp = F_normalize_safe(Qp, dim=-1)
 
-        # Similarity: [H,B,Tk,p']
-        S = torch.relu(torch.einsum('hbkd, hbpd -> hbkp', Kbar, Qp))
+        # Similarity per token to prototypes: [H,B,Tk,p']
+        S = torch.relu(torch.einsum('hbkd,hbpd->hbkp', Kbar, Qp))
 
         # Prefilter score per token: [H,B,Tk]
-        mean = S.mean(-1); mx = S.max(-1).values
-        kq = max(1, int(round(S.size(-1) * self.cfg.topk_frac)))
+        mean = S.mean(-1)
+        mx   = S.max(-1).values
+        kq   = max(1, int(round(S.size(-1) * self.cfg.topk_frac)))
         topk_mean = torch.topk(S, k=kq, dim=-1).values.mean(-1)
-        std = S.std(-1)
-        u_full = (self.cfg.w_mean*mean + self.cfg.w_max*mx
-                + self.cfg.w_topk*topk_mean + self.cfg.w_std*std)  # [H,B,Tk]
+        std  = S.std(-1)
+        u_full = (self.cfg.w_mean * mean + self.cfg.w_max * mx
+                + self.cfg.w_topk * topk_mean + self.cfg.w_std * std)   # [H,B,Tk]
 
+        # Top-U prefilter per (h,b)
         U = int(min(max(1, int(self.cfg.top_u)), Tk))
-        # top-U per (h,b)
-        u_vals, top_idx = torch.topk(u_full, k=U, dim=-1)            # [H,B,U]
-        # Restrict S to those candidates
+        _, top_idx = torch.topk(u_full, k=U, dim=-1)                       # [H,B,U]
         idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, -1, S.size(-1))
-        S_sub = torch.gather(S, dim=2, index=idx_exp)                # [H,B,U,p']
+        S_sub = torch.gather(S, dim=2, index=idx_exp)                      # [H,B,U,p']
 
-        # Greedy FL per (h,b)
+        # Greedy facility-location per (h,b)
         p_eff = S_sub.size(-1)
-        m = torch.zeros(H, bsz, p_eff, device=device, dtype=S_sub.dtype)
+        m = torch.zeros(H, bsz, p_eff, device=device, dtype=S_sub.dtype)   # running max coverage
         blocked = torch.zeros(H, bsz, U, device=device, dtype=torch.bool)
         chosen_local = torch.zeros(H, bsz, g_eff, device=device, dtype=torch.long)
 
         steps = min(g_eff, U)
         for r in range(steps):
-            gains = torch.relu(S_sub - m.unsqueeze(2)).sum(dim=-1)   # [H,B,U]
+            gains = torch.relu(S_sub - m.unsqueeze(2)).sum(dim=-1)         # [H,B,U]
             gains = gains.masked_fill(blocked, -1e9)
-            j = gains.argmax(dim=-1)                                 # [H,B]
+            j = gains.argmax(dim=-1)                                       # [H,B] (indices in 0..U-1)
             chosen_local[:, :, r] = j
             blocked.scatter_(2, j.unsqueeze(-1), True)
-            m = torch.maximum(m, S_sub[torch.arange(H)[:,None], torch.arange(bsz)[None,:], j, :])
+            # m = max(m, S_sub[..., j, :])  (gather version, vectorized)
+            sel = S_sub.gather(2, j.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, p_eff)).squeeze(2)  # [H,B,p']
+            m = torch.maximum(m, sel)
 
-        chosen_abs = torch.gather(top_idx, dim=2, index=chosen_local)   # [H,B,g_eff]
-        return [chosen_abs[h] for h in range(H)]                         # list of [B,g_eff]
+        chosen_abs = torch.gather(top_idx, dim=2, index=chosen_local)      # [H,B,g_eff]
+        return [chosen_abs[h] for h in range(H)]                           # list of [B,g_eff]
+
 
 
 
@@ -557,7 +575,7 @@ class BiggerBird(BartAttention):
             # ---- globals per head (facility-location; amortized) ----
             H = self.num_heads
             Qh = Q.view(H, bsz, tgt_len, self.head_dim)                # [H,B,Tq,d]
-            q_summary = F_normalize_safe(Qh.mean(dim=1), dim=-1)       # [H,Tq,d]
+            q_summary = F_normalize_safe(Qh, dim=-1)       # [H,Tq,d]
 
             globals_per_head = self.runtime.maybe_get_shared_globals(getattr(self, "layer_idx", None), src_len)
             if globals_per_head is None or len(globals_per_head) != H or globals_per_head[0].numel() < g_eff:
@@ -570,15 +588,27 @@ class BiggerBird(BartAttention):
             t = max(0, int(t_eff))
             tele_list: List[torch.Tensor] = []
             if t > 0:
-                head_slices = K.view(H, bsz, src_len, self.head_dim).mean(dim=1)   # [H,Tk,d]
-                Kbar = F.normalize(head_slices, dim=-1)                             # [H,Tk,d]
-                p = max(1, int(self.cfg.proto_count))
-                idxp = self.global_chooser._proto_idx(tgt_len, p, device)          # [p']
-                Qp = q_summary.index_select(1, idxp)                                # [H,p',d]
-                S_long = torch.relu(torch.matmul(Kbar, Qp.transpose(1, 2)))         # [H,Tk,p']
-                u_long = S_long.mean(dim=-1)                                        # [H,Tk]
+                # Keys averaged across batch (per-head)
+                K_head = K.view(H, bsz, src_len, self.head_dim).mean(dim=1)   # [H,Tk,d]
+                Kbar   = F_normalize_safe(K_head, dim=-1)                     # [H,Tk,d]
 
-                tele_biased = int(round(t * float(self.cfg.teleport_bias_frac)))
+                # Reduce q_summary back to per-head for teleports only
+                # q_summary is [H,B,Tq,d] after your change; fall back if still 3D
+                if q_summary.dim() == 4:
+                    q_long = F_normalize_safe(q_summary.mean(dim=1), dim=-1)  # [H,Tq,d]
+                else:
+                    q_long = q_summary                                        # [H,Tq,d]
+
+                p = max(1, int(self.cfg.proto_count))
+                idxp = self.global_chooser._proto_idx(tgt_len, p, device)     # [p']
+                Qp   = q_long.index_select(1, idxp)                           # [H,p',d]
+                Qp   = F_normalize_safe(Qp, dim=-1)
+
+                # Similarity to long-range prototypes: [H,Tk,p']
+                S_long = torch.relu(torch.einsum('hkd,hpd->hkp', Kbar, Qp))
+                u_long = S_long.mean(dim=-1)                                   # [H,Tk]
+
+                tele_biased  = int(round(t * float(self.cfg.teleport_bias_frac)))
                 tele_uniform = t - tele_biased
                 for h in range(H):
                     picks = []
@@ -590,6 +620,7 @@ class BiggerBird(BartAttention):
                     tele_list.append(tele)
             else:
                 tele_list = [torch.empty(0, dtype=torch.long, device=device) for _ in range(H)]
+
     
             # --- always-global anchors (CLS and EOS) ---
             if attention_mask is not None and attention_mask.dim() == 2:  # [B,T]
@@ -723,12 +754,38 @@ def patch_bart_with_biggerbird(model: nn.Module, cfg: RouterConfig) -> RouterRun
     _recurse(model)
     return runtime
 
+class AttnPool(nn.Module):
+    """
+    Single-head additive attention pooling:
+      scores_t = w^T tanh(W x_t)  -> softmax over T  ->  sum_t a_t x_t
+    """
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.proj  = nn.Linear(hidden_size, hidden_size)
+        self.score = nn.Linear(hidden_size, 1, bias=False)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        x:    [B, T, D]
+        mask: [B, T] (1 for real tokens, 0 for pad)
+        """
+        h = torch.tanh(self.proj(x))               # [B,T,D]
+        s = self.score(h).squeeze(-1)              # [B,T]
+        # mask pads to -inf before softmax (MPS-safe)
+        s = s.masked_fill(~mask.bool(), torch.finfo(s.dtype).min)
+        a = torch.softmax(s, dim=-1)               # [B,T]
+        pooled = torch.bmm(a.unsqueeze(1), x).squeeze(1)  # [B,D]
+        return pooled
 
 class BiggerBirdBartForSequenceClassification(nn.Module):
     def __init__(self, base_model: nn.Module, cfg: RouterConfig = default_router_config):
         super().__init__()
         self.model = base_model
         self.runtime = patch_bart_with_biggerbird(self.model, cfg)
+
+        # hidden size for BART is usually config.d_model (not hidden_size)
+        hidden_size = getattr(self.model.config, "hidden_size", None) or getattr(self.model.config, "d_model")
+        self.attn_pool = AttnPool(hidden_size)
 
     def gradient_checkpointing_enable(self, **kwargs):
         if hasattr(self.model, "gradient_checkpointing_enable"):
@@ -777,17 +834,33 @@ class BiggerBirdBartForSequenceClassification(nn.Module):
                 else:
                     attention_mask = torch.ones(last_hidden.size()[:2], device=last_hidden.device, dtype=torch.long)
 
-            # === masked mean pooling over tokens (pads excluded) ===
-            mask = attention_mask.unsqueeze(-1)                     # [B, T, 1]
-            summed = (last_hidden * mask).sum(dim=1)                # [B, D]
-            denom = mask.sum(dim=1).clamp_min(1)                    # [B, 1]
-            pooled = summed / denom                                 # [B, D]
+            # Attention pooling            
+            mask_bool = attention_mask.bool()  # shape [B, T]
+            pooled = self.attn_pool(last_hidden, mask_bool)   # <-- pass the mask
 
             # same classification head as BartForSequenceClassification
             logits = self.model.classification_head(pooled)
 
-            # Let Trainer handle label smoothing if configured → don't return a custom loss
-            return SequenceClassifierOutput(logits=logits)
+            # same classification head as BartForSequenceClassification
+            logits = self.model.classification_head(pooled)
+
+            # ---- compute loss for Trainer ----
+            loss = None
+            if labels is not None:
+                if labels.dtype != torch.long:
+                    labels = labels.long()
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(
+                    logits.view(-1, self.model.config.num_labels),
+                    labels.view(-1),
+                )
+
+            # return HF-style output
+            if return_dict:
+                return SequenceClassifierOutput(loss=loss, logits=logits)
+            else:
+                output = (logits,)
+                return ((loss,) + output) if loss is not None else output
         finally:
             self.runtime.end_forward()
 
@@ -1021,7 +1094,7 @@ def make_args(out_dir: str) -> TrainingArguments:
         torch_compile=torch_compile,    # off on MPS
         optim="adamw_torch",
         eval_accumulation_steps=eval_accum,
-        label_smoothing_factor=0.05,
+        #label_smoothing_factor=0.05,
     )
 
 def load_bigbird_tok(model_name: str):
